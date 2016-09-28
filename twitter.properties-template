@@ -1,0 +1,17 @@
+# Your Twitter app credentials
+oauth.consumerKey = *************************
+oauth.consumerSecret = ****************************
+
+oauth.accessToken = *********************************
+oauth.accessTokenSecret = **********************************
+
+#debug = true
+
+# HTTP proxy server host name
+#http.proxyHost = my-proxy.mydomain.com
+#HTTP proxy server port
+#http.proxyPort = 8080
+# HTTP proxy server user name
+#http.proxyUser = my-proxy-username
+# HTTP proxy server password
+#http.proxyPassword = my-proxy-password
