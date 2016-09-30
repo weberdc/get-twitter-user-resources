@@ -25,31 +25,29 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.Date;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 import org.apache.commons.cli.BasicParser;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
 import org.apache.commons.cli.HelpFormatter;
+import org.apache.commons.cli.OptionBuilder;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 
 import twitter4j.RateLimitStatus;
 import twitter4j.RateLimitStatusEvent;
 import twitter4j.RateLimitStatusListener;
-import twitter4j.ResponseList;
 import twitter4j.Twitter;
 import twitter4j.TwitterException;
 import twitter4j.TwitterFactory;
-import twitter4j.TwitterObjectFactory;
-import twitter4j.User;
 import twitter4j.conf.Configuration;
 import twitter4j.conf.ConfigurationBuilder;
 
@@ -60,124 +58,214 @@ import twitter4j.conf.ConfigurationBuilder;
  * @see <a href=
  *      "https://github.com/yusuke/twitter4j/blob/master/twitter4j-examples/src/main/java/twitter4j/examples/json/SaveRawJSON.java">SaveRawJSON.java</a>
  * @see <a href=
- *      "https://dev.twitter.com/rest/reference/get/users/lookup">Twitter's
- *      <code>GET users/lookup</code> endpoint</a>
+ *      "https://dev.twitter.com/rest/reference/get/statuses/user_timeline">Twitter's
+ *      <code>GET status/user_timeline</code> endpoint</a>
  */
+@SuppressWarnings("static-access")
 public final class TwitterUserResourcesRetrieverApp {
     private static Logger LOG = LoggerFactory.getLogger(TwitterUserResourcesRetrieverApp.class);
     private static final int FETCH_BATCH_SIZE = 100;
-    private static final Options OPTIONS = new Options();
-    static {
-        OPTIONS.addOption("i", "ids-file", true, "File of Twitter screen names");
-        OPTIONS.addOption("o", "output-directory", true, "Directory to which to write profiles (default: ./profiles)");
-        OPTIONS.addOption("c", "credentials", true, "File of Twitter credentials (default: ./twitter.properties)");
-        OPTIONS.addOption("d", "debug", false, "Turn on debugging information (default: false)");
-        OPTIONS.addOption("?", "help", false, "Ask for help with using this tool.");
-    }
 
-    /**
-     * Prints how the app ought to be used and causes the VM to exit.
-     */
-    private static void printUsageAndExit() {
-        new HelpFormatter().printHelp("TwitterUserResourcesRetrieverApp", OPTIONS);
-        System.exit(0);
-    }
+    static class Config {
+        private static final Options OPTIONS = new Options();
+        static {
+            OPTIONS.addOption("i", "identifiers-file", true, "File of Twitter screen names");
+            OPTIONS.addOption(longOpt("tweets", "Collect statuses (tweets)").create());
+            OPTIONS.addOption(longOpt("favourites", "Collect favourites").create());
+            OPTIONS.addOption(longOpt("followers", "Collect follower IDs").create());
+            OPTIONS.addOption(longOpt("friends", "Collect friend (followee) IDs").create());
+            OPTIONS.addOption("o", "output-directory", true, "Directory to which to write profiles (default: ./output)");
+            OPTIONS.addOption("c", "credentials", true, "File of Twitter credentials (default: ./twitter.properties)");
+            OPTIONS.addOption("d", "debug", false, "Turn on debugging information (default: false)");
+            OPTIONS.addOption("?", "help", false, "Ask for help with using this tool.");
+        }
 
-    public static void main(String[] args) throws IOException {
-        final CommandLineParser parser = new BasicParser();
-        String screenNamesFile = null;
+        private static OptionBuilder longOpt(String name, String description) {
+            return OptionBuilder.withLongOpt(name).withDescription(description);
+        }
+
+        /**
+         * Prints how the app ought to be used and causes the VM to exit.
+         */
+        private static void printUsageAndExit() {
+            new HelpFormatter().printHelp("TwitterUserResourcesRetrieverApp", OPTIONS);
+            System.exit(0);
+        }
+
+        String identifiersFile = null;
+        boolean expectIDs = false;
+        boolean collectTweets = false;
+        boolean collectFaves = false;
+        boolean collectFollowers = false;
+        boolean collectFriends = false;
         String outputDir = "./output";
         String credentialsFile = "./twitter.properties";
         boolean debug = false;
-        try {
-            final CommandLine cmd = parser.parse(OPTIONS, args);
-            if (cmd.hasOption('i')) screenNamesFile = cmd.getOptionValue('i');
-            if (cmd.hasOption('o')) outputDir = cmd.getOptionValue('o');
-            if (cmd.hasOption('c')) credentialsFile = cmd.getOptionValue('c');
-            if (cmd.hasOption('d')) debug = true;
-            if (cmd.hasOption('h')) printUsageAndExit();
-        } catch (ParseException e) {
-            e.printStackTrace();
-        }
-        // check config
-        if (screenNamesFile == null) {
-            printUsageAndExit();
+
+        static Config parse(String[] args) {
+            final CommandLineParser parser = new BasicParser();
+            Config cfg = new Config();
+            try {
+                final CommandLine cmd = parser.parse(OPTIONS, args);
+                if (cmd.hasOption('i')) cfg.identifiersFile = cmd.getOptionValue('i');
+                if (cmd.hasOption("tweets")) cfg.collectTweets = true; // 200
+                if (cmd.hasOption("favourites")) cfg.collectFaves = true; // nom 200
+                if (cmd.hasOption("followers")) cfg.collectFollowers = true;
+                if (cmd.hasOption("friends")) cfg.collectFriends = true;
+                if (cmd.hasOption('o')) cfg.outputDir = cmd.getOptionValue('o');
+                if (cmd.hasOption('c')) cfg.credentialsFile = cmd.getOptionValue('c');
+                if (cmd.hasOption('d')) cfg.debug = true;
+                if (cmd.hasOption('h')) printUsageAndExit();
+            } catch (ParseException e) {
+                e.printStackTrace();
+            }
+            return cfg;
         }
 
-        new TwitterUserResourcesRetrieverApp().run(screenNamesFile, outputDir, credentialsFile, debug);
+        public void check() {
+            if (this.identifiersFile == null) {
+                printUsageAndExit();
+            }
+        }
     }
+
+    /**
+     * Encapsulates the holy trinity of Twitter API rate limit data.
+     */
+    public class LimitData {
+
+        /**
+         * The maximum call limit per limiting window.
+         */
+        public int limit;
+
+        /**
+         * The remaining call limit in the current limiting window.
+         */
+        public int remaining;
+
+        /**
+         * The timestamp, as seconds offset in modern Unix era, at which the next limiting window starts.
+         */
+        public long reset;
+
+        public LimitData(final int limit, final int remaining, final long reset) {
+            this.limit = limit;
+            this.remaining = remaining;
+            this.reset = reset;
+        }
+
+        @Override
+        public String toString() {
+            return "[" + remaining + "/" + limit + "/" + reset + "]";
+        }
+    }
+
+    public static void main(String[] args) throws IOException, TwitterException {
+        Config cfg = Config.parse(args);
+        cfg.check();
+
+        new TwitterUserResourcesRetrieverApp().run(cfg);
+    }
+
+    /**
+     * For each API end point, the mutex controlling access to the path. Keys of this map are are a function of end point paths; see
+     * {@link #endpointPathToLimitKey(String)}.
+     */
+    public Map<String, ReentrantLock> limitsMutex;
+
+    /**
+     * Map from API end point to limit data for that endpoint. Keys of this map are are a function of end point paths; see
+     * {@link #endpointPathToLimitKey(String)}.
+     */
+    public Map<String, LimitData> limits;
 
     /**
      * Fetch the profiles specified by the screen names in the given {@code screenNamesFile}
      * and write the profiles to the given {@code outputDir}.
      *
-     * @param screenNamesFile Path to file with screen names, one per line.
-     * @param outputDir Path to directory into which to write fetched profiles.
-     * @param credentialsFile Path to properties file with Twitter credentials.
-     * @param debug Whether to increase debug logging.
+     * @param cfg Config instance with all required configuration.
+     * @throws IOException If an error occurs reading files or talking to the network
+     * @throws TwitterException If an error occurs haggling with Twitter
      */
-    public void run(
-        final String screenNamesFile,
-        final String outputDir,
-        final String credentialsFile,
-        final boolean debug
-    ) throws IOException {
+    public void run(final Config cfg) throws IOException, TwitterException {
 
         LOG.info("Collecting profiles");
-        LOG.info("  Twitter screen names: " + screenNamesFile);
-        LOG.info("  output directory: " + outputDir);
+        LOG.info("  Twitter identifiers: " + cfg.identifiersFile);
+        LOG.info("  output directory: " + cfg.outputDir);
 
-        final List<String> screenNames = this.loadScreenNames(screenNamesFile);
+        final List<String> screenNames = this.loadScreenNames(cfg.identifiersFile);
 
         LOG.info("Read {} screen names", screenNames.size());
 
-        if (!Files.exists(Paths.get(outputDir))) {
-            LOG.info("Creating output directory {}", outputDir);
-            Paths.get(outputDir).toFile().mkdirs();
+        if (!Files.exists(Paths.get(cfg.outputDir))) {
+            LOG.info("Creating output directory {}", cfg.outputDir);
+            Paths.get(cfg.outputDir).toFile().mkdirs();
         }
 
         final Configuration config =
-            TwitterUserResourcesRetrieverApp.buildTwitterConfiguration(credentialsFile, debug);
+            TwitterUserResourcesRetrieverApp.buildTwitterConfiguration(cfg.credentialsFile, cfg.debug);
         final Twitter twitter = new TwitterFactory(config).getInstance();
-        twitter.addRateLimitStatusListener(this.rateLimitStatusListener);
-        final ObjectMapper json = new ObjectMapper();
 
-        for (final List<String> batch : Lists.partition(screenNames, FETCH_BATCH_SIZE)) {
+        retrieveRateLimits(twitter);
 
-            try {
-                LOG.info("Looking up {} users' profiles", batch.size());
-
-                // ask Twitter for profiles
-                final String[] allocation = new String[batch.size()];
-                final ResponseList<User> profiles = twitter.lookupUsers(batch.toArray(allocation));
-
-                // extract the raw JSON
-                final String rawJsonProfiles = TwitterObjectFactory.getRawJSON(profiles);
-
-                // traverse the raw JSON (rather than the Twitter4j structures)
-                final JsonNode profilesJsonNode = json.readTree(rawJsonProfiles);
-                profilesJsonNode.forEach (profileNode ->  {
-
-                    // extract vars for logging and filename creation
-                    final String profileId = profileNode.get("id_str").asText();
-                    final String screenName = profileNode.get("screen_name").asText();
-
-                    final String fileName = outputDir + "/profile-" + profileId + ".json";
-
-                    LOG.info("Profile @{} {} -> {}", screenName, profileId, fileName);
-                    try {
-                        saveJSON(profileNode.toString(), fileName);
-                    } catch (IOException e) {
-                        LOG.warn("Failed to write to {}", fileName, e);
-                    }
-                });
-
-            } catch (TwitterException e) {
-                LOG.warn("Failed to communicate with Twitter", e);
-            }
-        }
+//        twitter.addRateLimitStatusListener(this.rateLimitStatusListener);
+//        final ObjectMapper json = new ObjectMapper();
+//
+//        for (final List<String> batch : Lists.partition(screenNames, FETCH_BATCH_SIZE)) {
+//
+//            try {
+//                LOG.info("Looking up {} users' profiles", batch.size());
+//
+//                // ask Twitter for profiles
+//                final String[] allocation = new String[batch.size()];
+//                final ResponseList<User> profiles = twitter.lookupUsers(batch.toArray(allocation));
+//
+//                // extract the raw JSON
+//                final String rawJsonProfiles = TwitterObjectFactory.getRawJSON(profiles);
+//
+//                // traverse the raw JSON (rather than the Twitter4j structures)
+//                final JsonNode profilesJsonNode = json.readTree(rawJsonProfiles);
+//                profilesJsonNode.forEach (profileNode ->  {
+//
+//                    // extract vars for logging and filename creation
+//                    final String profileId = profileNode.get("id_str").asText();
+//                    final String screenName = profileNode.get("screen_name").asText();
+//
+//                    final String fileName = outputDir + "/profile-" + profileId + ".json";
+//
+//                    LOG.info("Profile @{} {} -> {}", screenName, profileId, fileName);
+//                    try {
+//                        saveJSON(profileNode.toString(), fileName);
+//                    } catch (IOException e) {
+//                        LOG.warn("Failed to write to {}", fileName, e);
+//                    }
+//                });
+//
+//            } catch (TwitterException e) {
+//                LOG.warn("Failed to communicate with Twitter", e);
+//            }
+//        }
     }
 
+
+    private void retrieveRateLimits(Twitter twitter) throws TwitterException {
+        this.limitsMutex = Maps.newConcurrentMap();
+        this.limits = Maps.newConcurrentMap();
+        Map<String, RateLimitStatus> rateLimitStatuses = twitter.getRateLimitStatus(
+            "statuses",  // for "/statuses/user_timeline",
+            "favorites", // for "/favorites/list",
+            "followers", // for "/followers/ids",
+            "friends"    // for "/friends/ids"
+        );
+        rateLimitStatuses.forEach((endpoint, rls) -> {
+            System.out.println("Resource: " + endpoint + " -> " + rls.toString());
+            limitsMutex.put(endpoint, new ReentrantLock(true));
+            limits.put(endpoint, new LimitData(rls.getLimit(), rls.getRemaining(), rls.getResetTimeInSeconds()));
+        });
+
+
+    }
 
     /**
      * Writes the given {@code rawJSON} {@link String} to the specified file.
