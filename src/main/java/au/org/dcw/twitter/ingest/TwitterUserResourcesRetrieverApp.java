@@ -23,12 +23,26 @@ import java.io.OutputStreamWriter;
 import java.io.Reader;
 import java.nio.file.Files;
 import java.nio.file.Paths;
-import java.util.Date;
+import java.security.KeyManagementException;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
+
+import javax.net.ssl.KeyManager;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 
 import org.apache.commons.cli.BasicParser;
 import org.apache.commons.cli.CommandLine;
@@ -37,17 +51,31 @@ import org.apache.commons.cli.HelpFormatter;
 import org.apache.commons.cli.OptionBuilder;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
+import org.apache.http.Consts;
+import org.apache.http.HttpEntity;
+import org.apache.http.NameValuePair;
+import org.apache.http.client.entity.UrlEncodedFormEntity;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.http.message.BasicNameValuePair;
+import org.apache.http.util.EntityUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.Maps;
 
+import twitter4j.Paging;
 import twitter4j.RateLimitStatus;
-import twitter4j.RateLimitStatusEvent;
-import twitter4j.RateLimitStatusListener;
+import twitter4j.ResponseList;
+import twitter4j.Status;
 import twitter4j.Twitter;
 import twitter4j.TwitterException;
 import twitter4j.TwitterFactory;
+import twitter4j.TwitterObjectFactory;
 import twitter4j.conf.Configuration;
 import twitter4j.conf.ConfigurationBuilder;
 
@@ -63,8 +91,20 @@ import twitter4j.conf.ConfigurationBuilder;
  */
 @SuppressWarnings("static-access")
 public final class TwitterUserResourcesRetrieverApp {
+    /**
+     * This fudge amount (milliseconds) is added to the time a thread goes to
+     * sleep when it needs to wait until the next rate limiting window. This is
+     * to guard against clock skew between the local clock and Twitter's clock,
+     * and also the inherent jitter in Thread.sleep(). 10 seconds seems like a
+     * reasonable amount.
+     */
+    private static final int SLEEP_DURATION_FUDGE_AMOUNT = 10000;
+    private static final String USER_AGENT = "Mozilla/5.0";
+
+    private static final String GET_TWEETS = "/statuses/home_timeline";
+
     private static Logger LOG = LoggerFactory.getLogger(TwitterUserResourcesRetrieverApp.class);
-    private static final int FETCH_BATCH_SIZE = 100;
+//    private static final int FETCH_BATCH_SIZE = 100;
 
     static class Config {
         private static final Options OPTIONS = new Options();
@@ -179,7 +219,12 @@ public final class TwitterUserResourcesRetrieverApp {
      * {@link #endpointPathToLimitKey(String)}.
      */
     public Map<String, LimitData> limits;
+    private CloseableHttpClient httpClient;
 
+    @FunctionalInterface
+    interface ApiCall<Arg1, Arg2, RetType> {
+        public RetType apply(Arg1 arg1, Arg2 arg2);
+    }
     /**
      * Fetch the profiles specified by the screen names in the given {@code screenNamesFile}
      * and write the profiles to the given {@code outputDir}.
@@ -193,6 +238,13 @@ public final class TwitterUserResourcesRetrieverApp {
         LOG.info("Collecting profiles");
         LOG.info("  Twitter identifiers: " + cfg.identifiersFile);
         LOG.info("  output directory: " + cfg.outputDir);
+        LOG.info("  Collecting tweets:     " + cfg.collectTweets);
+        LOG.info("  Collecting favourites: " + cfg.collectFaves);
+        LOG.info("  Collecting followers:  " + cfg.collectFollowers);
+        LOG.info("  Collecting friends:    " + cfg.collectFriends);
+
+        this.httpClient =
+            HttpClientBuilder.create().setSSLContext(this.setupSSLCertificates()).build();
 
         final List<String> screenNames = this.loadScreenNames(cfg.identifiersFile);
 
@@ -207,15 +259,92 @@ public final class TwitterUserResourcesRetrieverApp {
             TwitterUserResourcesRetrieverApp.buildTwitterConfiguration(cfg.credentialsFile, cfg.debug);
         final Twitter twitter = new TwitterFactory(config).getInstance();
 
-        retrieveRateLimits(twitter);
+        this.retrieveRateLimits(twitter);
 
-//        twitter.addRateLimitStatusListener(this.rateLimitStatusListener);
-//        final ObjectMapper json = new ObjectMapper();
-//
-//        for (final List<String> batch : Lists.partition(screenNames, FETCH_BATCH_SIZE)) {
-//
-//            try {
-//                LOG.info("Looking up {} users' profiles", batch.size());
+        final ObjectMapper json = new ObjectMapper();
+
+        for (final String screenName : screenNames) {
+
+            try {
+                LOG.info("Looking up @{}'s resources", screenName);
+                final String userId = this.screenNameToID(screenName);
+                LOG.info("@{} -> ID {}", screenName, userId);
+
+                // Retrieve tweets
+                if (cfg.collectTweets) {
+                    final String limitKey = GET_TWEETS;
+                    LOG.info("Collecting Tweets by @{} with {}", screenName, limitKey);
+                    ApiCall<Twitter, String, RateLimitStatus> callback = (Twitter tw, String sn) -> {
+                        try {
+                            final ResponseList<Status> userTimeline = tw.getUserTimeline(sn, new Paging(1, 200));
+                            // extract raw json and write it to file
+                            final String rawJsonTweets = TwitterObjectFactory.getRawJSON(userTimeline);
+                            final StringBuilder tweetsToSave = new StringBuilder();
+                            for (JsonNode tweetNode : json.readTree(rawJsonTweets)) {
+                                tweetsToSave.append(tweetNode.asText()).append('\n');
+                            }
+                            saveText(tweetsToSave.toString(), userId + "-tweets.json");
+                            return userTimeline.getRateLimitStatus();
+                        } catch (IOException | TwitterException e) {
+                            LOG.warn("Barfed parsing JSON or saving to file tweets for {}.", screenName, e);
+                        }
+                        return null;
+                    };
+
+                    LOG.debug("Acquiring mutex for limit key {}", limitKey);
+                    limitsMutex.get(limitKey).lockInterruptibly();
+                    try {
+                        LOG.debug("Acquired mutex for limit key {}", limitKey);
+                        LimitData limitData = limits.get(limitKey);
+                        LOG.debug("There are {} remaining calls to {}", limitData.remaining, limitKey);
+                        if (limitData.remaining == 0) {
+                            // Fudge added to the advertised reset time to guard against local sleep duration
+                            // jitter and clock skew between local clock and Twitter's clock.
+                            long sleepDurationMillis =
+                                limitData.reset * 1000 - System.currentTimeMillis() + SLEEP_DURATION_FUDGE_AMOUNT;
+                            if (sleepDurationMillis > 0) {
+                                LOG.debug(
+                                    "Sleeping {} seconds to get past reset timestamp {}.",
+                                    sleepDurationMillis / 1000f,
+                                    formatNicely(limitData.reset)
+                                );
+                                Thread.sleep(sleepDurationMillis);
+                                LOG.debug("And I'm back.");
+                            } else {
+                                LOG.debug(
+                                    "But the limit for {} will have reset by now : reset timestamp is {}.",
+                                    limitKey, formatNicely(limitData.reset)
+                                );
+                            }
+                        }
+
+                        RateLimitStatus rls = callback.apply(twitter, screenName);
+
+                        if (rls != null) {
+                            limitData.remaining = rls.getRemaining();
+                            LOG.debug("Endpoint {} has {} calls remaining.", limitKey, limitData.remaining);
+                            limitData.reset = rls.getResetTimeInSeconds();
+                            LOG.debug("Endpoint {} has a new reset time: {}.", limitKey, limitData.reset);
+                        }
+
+                    } finally {
+                        limitsMutex.get(limitKey).unlock();
+                        LOG.debug("Released mutex for limit key {}", limitKey);
+                    }
+
+                }
+                // Retrieve favourites
+                if (cfg.collectFaves) {
+
+                }
+                // Retrieve followers
+                if (cfg.collectFollowers) {
+
+                }
+                // Retrieve friends
+                if (cfg.collectFriends) {
+
+                }
 //
 //                // ask Twitter for profiles
 //                final String[] allocation = new String[batch.size()];
@@ -241,11 +370,102 @@ public final class TwitterUserResourcesRetrieverApp {
 //                        LOG.warn("Failed to write to {}", fileName, e);
 //                    }
 //                });
-//
-//            } catch (TwitterException e) {
-//                LOG.warn("Failed to communicate with Twitter", e);
-//            }
-//        }
+
+            } catch (/*TwitterException*/ Throwable e) {
+                LOG.warn("Failed to communicate with Twitter", e);
+            }
+        }
+    }
+
+
+    private String screenNameToID(final String screenName) {
+        String id = screenName;
+        try {
+//            HttpPost post = new HttpPost("https://75.119.200.192/ajax.php");
+            HttpPost post = new HttpPost("https://tweeterid.com/ajax.php");
+            post.setHeader("User-Agent", this.USER_AGENT);
+            List<NameValuePair> formparams = new ArrayList<>();
+            formparams.add(new BasicNameValuePair("input", screenName));
+            post.setEntity(new UrlEncodedFormEntity(formparams, Consts.UTF_8));
+
+            CloseableHttpResponse response = this.httpClient.execute(post);
+            try {
+                LOG.info("Status: {}", response.getStatusLine().getStatusCode());
+                LOG.info("Reason: {}", response.getStatusLine().getReasonPhrase());
+                HttpEntity entity = response.getEntity();
+                if (entity != null) {
+                    long len = entity.getContentLength();
+                    if (len != -1 && len < 2048) {
+                        id = EntityUtils.toString(entity);
+                        System.out.println("Resolved @" + screenName + " -> " + id);
+                    } else {
+                        System.err.println("Error converting screen name to ID: Error in response");
+                        EntityUtils.consume(entity);
+                        System.err.println("=> " + EntityUtils.toString(entity));
+                    }
+                }
+            } finally {
+                response.close();
+            }
+        } catch (IOException e) {
+            LOG.warn("Error converting screen name to ID", e);
+        }
+        return id;
+    }
+
+
+    /**
+     * A forgiving SSL setup is required for talking to https://tweeterid.com/
+     * to do reverse-lookups of user IDs to follow.
+     * <p>
+     *
+     * @see <a href=
+     *      "http://stackoverflow.com/questions/1828775/how-to-handle-invalid-ssl-certificates-with-apache-httpclient">Props
+     *      to this post for how to do this.</a>
+     * @return A forgiving SSL context
+     */
+    private SSLContext setupSSLCertificates() {
+        // configure the SSLContext with a TrustManager
+        SSLContext ctx = null;
+        try {
+            ctx = SSLContext.getInstance("TLS");
+            ctx.init(new KeyManager[0], new TrustManager[] { new DefaultTrustManager() },
+                     new SecureRandom());
+            SSLContext.setDefault(ctx);
+        } catch (NoSuchAlgorithmException | KeyManagementException e) {
+            System.err.println("Error setting SSL up: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return ctx;
+    }
+
+
+    /**
+     * Forgiving trust manager for talking to https://...
+     */
+    private static class DefaultTrustManager implements X509TrustManager {
+
+        @Override
+        public void checkClientTrusted(X509Certificate[] arg0, String arg1)
+            throws CertificateException {
+        }
+
+        @Override
+        public void checkServerTrusted(X509Certificate[] arg0, String arg1)
+            throws CertificateException {
+        }
+
+        @Override
+        public X509Certificate[] getAcceptedIssuers() {
+            return null;
+        }
+    }
+
+
+    private String formatNicely(long epochSecond) {
+        return DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(
+            ZonedDateTime.ofInstant(Instant.ofEpochSecond(epochSecond), ZoneId.systemDefault())
+        );
     }
 
 
@@ -259,26 +479,26 @@ public final class TwitterUserResourcesRetrieverApp {
             "friends"    // for "/friends/ids"
         );
         rateLimitStatuses.forEach((endpoint, rls) -> {
-            System.out.println("Resource: " + endpoint + " -> " + rls.toString());
             limitsMutex.put(endpoint, new ReentrantLock(true));
             limits.put(endpoint, new LimitData(rls.getLimit(), rls.getRemaining(), rls.getResetTimeInSeconds()));
+            LOG.debug("Resource: {} -> {}", endpoint, limits.get(endpoint));
         });
 
 
     }
 
     /**
-     * Writes the given {@code rawJSON} {@link String} to the specified file.
+     * Writes the given {@code text} {@link String} to the specified file.
      *
-     * @param rawJSON  the JSON String to persist
-     * @param fileName the file (including path) to which to write the JSON
+     * @param text the String to persist (may be JSON)
+     * @param fileName the file (including path) to which to write the text
      * @throws IOException if there's a problem writing to the specified file
      */
-    private static void saveJSON(final String rawJSON, final String fileName) throws IOException {
+    private static void saveText(final String text, final String fileName) throws IOException {
         try (final FileOutputStream fos = new FileOutputStream(fileName);
              final OutputStreamWriter osw = new OutputStreamWriter(fos, "UTF-8");
              final BufferedWriter bw = new BufferedWriter(osw)) {
-            bw.write(rawJSON);
+            bw.write(text);
             bw.flush();
         }
     }
@@ -289,47 +509,6 @@ public final class TwitterUserResourcesRetrieverApp {
             .filter(l -> l.length() > 0 && ! l.startsWith("#"))
             .map(sn -> (sn.startsWith("@") ? sn.substring(1): sn))
             .collect(Collectors.toList());
-    }
-
-    /**
-     * Listener to pay attention to when the Twitter's rate limit is being approached or breached.
-     */
-    final RateLimitStatusListener rateLimitStatusListener = new RateLimitStatusListener() {
-        @Override
-        public void onRateLimitStatus(final RateLimitStatusEvent event) {
-            TwitterUserResourcesRetrieverApp.this.pauseIfNecessary(event.getRateLimitStatus());
-        }
-
-        @Override
-        public void onRateLimitReached(final RateLimitStatusEvent event) {
-            TwitterUserResourcesRetrieverApp.this.pauseIfNecessary(event.getRateLimitStatus());
-        }
-    };
-
-    /**
-     * If the provided {@link RateLimitStatus} indicates that we are about to break the rate
-     * limit, in terms of number of calls or time window, then sleep for the rest of the period.
-     *
-     * @param status The current status of the our calls to Twitter
-     */
-    protected void pauseIfNecessary(final RateLimitStatus status) {
-        if (status == null) {
-            return;
-        }
-
-        final int secondsUntilReset = status.getSecondsUntilReset();
-        final int callsRemaining = status.getRemaining();
-        if (secondsUntilReset < 10 || callsRemaining < 10) {
-            final int untilReset = status.getSecondsUntilReset() + 5;
-            LOG.info("Rate limit reached. Waiting {} seconds starting at {}...", untilReset, new Date());
-            try {
-                Thread.sleep(untilReset * 1000);
-            } catch (InterruptedException e) {
-                LOG.warn("Interrupted while sleeping waiting for Twitter.", e);
-                Thread.currentThread().interrupt(); // reset interrupt flag
-            }
-            LOG.info("Resuming...");
-        }
     }
 
     /**
