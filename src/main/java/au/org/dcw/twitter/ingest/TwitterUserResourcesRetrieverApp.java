@@ -23,26 +23,16 @@ import java.io.OutputStreamWriter;
 import java.io.Reader;
 import java.nio.file.Files;
 import java.nio.file.Paths;
-import java.security.KeyManagementException;
-import java.security.NoSuchAlgorithmException;
-import java.security.SecureRandom;
-import java.security.cert.CertificateException;
-import java.security.cert.X509Certificate;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
-
-import javax.net.ssl.KeyManager;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
 
 import org.apache.commons.cli.BasicParser;
 import org.apache.commons.cli.CommandLine;
@@ -51,21 +41,12 @@ import org.apache.commons.cli.HelpFormatter;
 import org.apache.commons.cli.OptionBuilder;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
-import org.apache.http.Consts;
-import org.apache.http.HttpEntity;
-import org.apache.http.NameValuePair;
-import org.apache.http.client.entity.UrlEncodedFormEntity;
-import org.apache.http.client.methods.CloseableHttpResponse;
-import org.apache.http.client.methods.HttpPost;
-import org.apache.http.impl.client.CloseableHttpClient;
-import org.apache.http.impl.client.HttpClientBuilder;
-import org.apache.http.message.BasicNameValuePair;
-import org.apache.http.util.EntityUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.base.Stopwatch;
 import com.google.common.collect.Maps;
 
 import twitter4j.Paging;
@@ -102,9 +83,12 @@ public final class TwitterUserResourcesRetrieverApp {
      * reasonable amount.
      */
     private static final int SLEEP_DURATION_FUDGE_AMOUNT = 10000;
-    private static final String USER_AGENT = "Mozilla/5.0";
+//    private static final String USER_AGENT = "Mozilla/5.0";
 
     private static final String GET_TWEETS = "/statuses/home_timeline";
+    private static final String GET_FAVES = "/favorites/list";
+    private static final String GET_FOLLOWERS = "/followers/ids";
+    private static final String GET_FRIENDS = "/friends/ids";
 
     private static Logger LOG = LoggerFactory.getLogger(TwitterUserResourcesRetrieverApp.class);
 //    private static final int FETCH_BATCH_SIZE = 100;
@@ -166,6 +150,9 @@ public final class TwitterUserResourcesRetrieverApp {
         }
 
         public void check() {
+            if (this.debug) {
+                System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "DEBUG");
+            }
             if (this.identifiersFile == null) {
                 printUsageAndExit();
             }
@@ -222,8 +209,10 @@ public final class TwitterUserResourcesRetrieverApp {
      * {@link #endpointPathToLimitKey(String)}.
      */
     public Map<String, LimitData> limits;
-    private CloseableHttpClient httpClient;
-    private Config cfg;
+//    private CloseableHttpClient httpClient;
+    private final Config cfg;
+    private final ObjectMapper json;
+    private Twitter twitter;
 
     @FunctionalInterface
     interface ApiCall<Arg1, RetType> {
@@ -238,6 +227,7 @@ public final class TwitterUserResourcesRetrieverApp {
      */
     public TwitterUserResourcesRetrieverApp(final Config cfg) {
         this.cfg = cfg;
+        this.json = new ObjectMapper();
     }
 
 
@@ -258,12 +248,14 @@ public final class TwitterUserResourcesRetrieverApp {
         LOG.info("  Collecting followers:  " + this.cfg.collectFollowers);
         LOG.info("  Collecting friends:    " + this.cfg.collectFriends);
 
-        this.httpClient =
-            HttpClientBuilder.create().setSSLContext(this.setupSSLCertificates()).build();
+//        this.httpClient =
+//            HttpClientBuilder.create().setSSLContext(this.setupSSLCertificates()).build();
 
         final List<String> ids = this.loadIDs(this.cfg.identifiersFile);
 
         LOG.info("Read {} Twitter IDs", ids.size());
+
+        Stopwatch timer = Stopwatch.createStarted();
 
         if (!Files.exists(Paths.get(this.cfg.outputDir))) {
             LOG.info("Creating output directory {}", this.cfg.outputDir);
@@ -272,90 +264,121 @@ public final class TwitterUserResourcesRetrieverApp {
 
         final Configuration config =
             TwitterUserResourcesRetrieverApp.buildTwitterConfiguration(this.cfg.credentialsFile, this.cfg.debug);
-        final Twitter twitter = new TwitterFactory(config).getInstance();
+        this.twitter = new TwitterFactory(config).getInstance();
 
-        this.retrieveRateLimits(twitter);
-
-        final ObjectMapper json = new ObjectMapper();
+        this.retrieveRateLimits(this.twitter);
 
         for (final String userId : ids) {
 
             try {
                 LOG.info("Looking up {}'s resources", userId);
-                final long idAsLong = Long.parseLong(userId);//this.screenNameToID(id);
-//                LOG.info("@{} -> ID {}", id, userId);
+                final long idAsLong = Long.parseLong(userId);
 
                 // Retrieve tweets
                 if (this.cfg.collectTweets) {
-                    LOG.info("Collecting Tweets by account {} with {}", userId, GET_TWEETS);
-                    ApiCall<Long, RateLimitStatus> callback = (Long id) -> {
-                        try {
-                            final ResponseList<Status> userTimeline = twitter.getUserTimeline(id.longValue(), new Paging(1, 200));
-                            // extract raw json and write it to file
-                            final String rawJsonTweets = TwitterObjectFactory.getRawJSON(userTimeline);
-//                            saveText(rawJsonTweets, cfg.outputDir + "/tmp.json");
-                            final StringBuilder tweetsToSave = new StringBuilder();
-                            int i = 0;
-                            for (JsonNode tweetNode : json.readTree(rawJsonTweets)) {
-                                i++;
-                                tweetsToSave.append(tweetNode.toString()).append('\n');
-                            }
-                            String tweetsFile = this.outFile(id.toString() + "-tweets.json");
-                            saveText(tweetsToSave.toString(), tweetsFile);
-                            LOG.info("Wrote {} tweets to {}", i, tweetsFile);
-                            return userTimeline.getRateLimitStatus();
-                        } catch (IOException | TwitterException e) {
-                            LOG.warn("Barfed parsing JSON or saving to file tweets for {}.", id, e);
-                        }
-                        return null;
-                    };
-
-                    this.makeApiCall(idAsLong, GET_TWEETS, callback);
-
+                    this.makeApiCall(idAsLong, GET_TWEETS, this.createGetTweetsCallback());
                 }
                 // Retrieve favourites
                 if (this.cfg.collectFaves) {
-
+                    this.makeApiCall(idAsLong, GET_FAVES, this.createGetFavesCallback());
                 }
                 // Retrieve followers
                 if (this.cfg.collectFollowers) {
-
+                    LOG.info("Collecting followers of #{} with {} - NYI", userId, GET_FOLLOWERS);
+//                    this.makeApiCall(idAsLong, GET_FOLLOWERS, this.createGetFollowersCallback());
                 }
                 // Retrieve friends
                 if (this.cfg.collectFriends) {
-
+                    LOG.info("Collecting accounts followed by #{} with {} - NYI", userId, GET_FRIENDS);
                 }
-//
-//                // ask Twitter for profiles
-//                final String[] allocation = new String[batch.size()];
-//                final ResponseList<User> profiles = twitter.lookupUsers(batch.toArray(allocation));
-//
-//                // extract the raw JSON
-//                final String rawJsonProfiles = TwitterObjectFactory.getRawJSON(profiles);
-//
-//                // traverse the raw JSON (rather than the Twitter4j structures)
-//                final JsonNode profilesJsonNode = json.readTree(rawJsonProfiles);
-//                profilesJsonNode.forEach (profileNode ->  {
-//
-//                    // extract vars for logging and filename creation
-//                    final String profileId = profileNode.get("id_str").asText();
-//                    final String screenName = profileNode.get("screen_name").asText();
-//
-//                    final String fileName = outputDir + "/profile-" + profileId + ".json";
-//
-//                    LOG.info("Profile @{} {} -> {}", screenName, profileId, fileName);
-//                    try {
-//                        saveJSON(profileNode.toString(), fileName);
-//                    } catch (IOException e) {
-//                        LOG.warn("Failed to write to {}", fileName, e);
-//                    }
-//                });
 
-            } catch (/*TwitterException*/ Throwable e) {
-                LOG.warn("Failed to communicate with Twitter", e);
+            } catch (InterruptedException e) {
+                LOG.warn("Failed to communicate with Twitter somehow", e);
             }
         }
+        LOG.info("Retrieval complete in {} seconds.", timer.elapsed(TimeUnit.SECONDS));
     }
+
+
+    private ApiCall<Long, RateLimitStatus> createGetTweetsCallback() {
+        ApiCall<Long, RateLimitStatus> callback = (Long id) -> {
+            try {
+                LOG.info("Collecting tweets posted by #{} with {}", id, GET_TWEETS);
+                final ResponseList<Status> userTimeline =
+                    this.twitter.getUserTimeline(id.longValue(), new Paging(1, 200));
+                // extract raw json and write it to file
+                final String rawJsonTweets = TwitterObjectFactory.getRawJSON(userTimeline);
+                final StringBuilder tweetsToSave = new StringBuilder();
+                int i = 0;
+                for (JsonNode tweetNode : this.json.readTree(rawJsonTweets)) {
+                    i++;
+                    tweetsToSave.append(tweetNode.toString()).append('\n');
+                }
+                String tweetsFile = this.outFile(id.toString() + "-tweets.json");
+                saveText(tweetsToSave.toString(), tweetsFile);
+                LOG.info("Wrote {} tweets to {}", i, tweetsFile);
+                return userTimeline.getRateLimitStatus();
+            } catch (IOException | TwitterException e) {
+                LOG.warn("Barfed parsing JSON or saving to file tweets for {}.", id, e);
+            }
+            return null;
+        };
+        return callback;
+    }
+
+
+    private ApiCall<Long, RateLimitStatus> createGetFavesCallback() {
+        ApiCall<Long, RateLimitStatus> callback = (Long id) -> {
+            try {
+                LOG.info("Collecting tweets favourited by #{} with {}", id, GET_FAVES);
+                final ResponseList<Status> favesTimeline =
+                    this.twitter.getFavorites(id.longValue(), new Paging(1, 200));
+                // extract raw json and write it to file
+                final String rawJsonTweets = TwitterObjectFactory.getRawJSON(favesTimeline);
+                final StringBuilder favesToSave = new StringBuilder();
+                int i = 0;
+                for (JsonNode tweetNode : this.json.readTree(rawJsonTweets)) {
+                    i++;
+                    favesToSave.append(tweetNode.toString()).append('\n');
+                }
+                String favesFile = this.outFile(id.toString() + "-favourites.json");
+                saveText(favesToSave.toString(), favesFile);
+                LOG.info("Wrote {} favourites to {}", i, favesFile);
+                return favesTimeline.getRateLimitStatus();
+            } catch (IOException | TwitterException e) {
+                LOG.warn("Barfed parsing JSON or saving to file favourites for {}.", id, e);
+            }
+            return null;
+        };
+        return callback;
+    }
+
+
+//    private ApiCall<Long, RateLimitStatus> createGetFollowersCallback() {
+//        ApiCall<Long, RateLimitStatus> callback = (Long id) -> {
+//            try {
+//                LOG.info("Collecting followers of account {} with {}", id, GET_FOLLOWERS);
+//                final ResponseList<Status> userTimeline =
+//                    this.twitter.getFavorites(id.longValue(), new Paging(1, 200));
+//                // extract raw json and write it to file
+//                final String rawJsonTweets = TwitterObjectFactory.getRawJSON(userTimeline);
+//                final StringBuilder favesToSave = new StringBuilder();
+//                int i = 0;
+//                for (JsonNode tweetNode : this.json.readTree(rawJsonTweets)) {
+//                    i++;
+//                    favesToSave.append(tweetNode.toString()).append('\n');
+//                }
+//                String favesFile = this.outFile(id.toString() + "-followers.json");
+//                saveText(favesToSave.toString(), favesFile);
+//                LOG.info("Wrote {} favourites to {}", i, favesFile);
+//                return userTimeline.getRateLimitStatus();
+//            } catch (IOException | TwitterException e) {
+//                LOG.warn("Barfed parsing JSON or saving to file favourites for {}.", id, e);
+//            }
+//            return null;
+//        };
+//        return callback;
+//    }
 
 
     /**
@@ -419,88 +442,88 @@ public final class TwitterUserResourcesRetrieverApp {
         return this.cfg.outputDir + FILE_SEPARATOR + filename;
     }
 
-    private String screenNameToID(final String screenName) {
-        String id = screenName;
-        try {
-//            HttpPost post = new HttpPost("https://75.119.200.192/ajax.php");
-            HttpPost post = new HttpPost("https://tweeterid.com/ajax.php");
-            post.setHeader("User-Agent", this.USER_AGENT);
-            List<NameValuePair> formparams = new ArrayList<>();
-            formparams.add(new BasicNameValuePair("input", screenName));
-            post.setEntity(new UrlEncodedFormEntity(formparams, Consts.UTF_8));
-
-            CloseableHttpResponse response = this.httpClient.execute(post);
-            try {
-                LOG.info("Status: {}", response.getStatusLine().getStatusCode());
-                LOG.info("Reason: {}", response.getStatusLine().getReasonPhrase());
-                HttpEntity entity = response.getEntity();
-                if (entity != null) {
-                    long len = entity.getContentLength();
-                    if (len != -1 && len < 2048) {
-                        id = EntityUtils.toString(entity);
-                        System.out.println("Resolved @" + screenName + " -> " + id);
-                    } else {
-                        System.err.println("Error converting screen name to ID: Error in response");
-                        EntityUtils.consume(entity);
-                        System.err.println("=> " + EntityUtils.toString(entity));
-                    }
-                }
-            } finally {
-                response.close();
-            }
-        } catch (IOException e) {
-            LOG.warn("Error converting screen name to ID", e);
-        }
-        return id;
-    }
-
-
-    /**
-     * A forgiving SSL setup is required for talking to https://tweeterid.com/
-     * to do reverse-lookups of user IDs to follow.
-     * <p>
-     *
-     * @see <a href=
-     *      "http://stackoverflow.com/questions/1828775/how-to-handle-invalid-ssl-certificates-with-apache-httpclient">Props
-     *      to this post for how to do this.</a>
-     * @return A forgiving SSL context
-     */
-    private SSLContext setupSSLCertificates() {
-        // configure the SSLContext with a TrustManager
-        SSLContext ctx = null;
-        try {
-            ctx = SSLContext.getInstance("TLS");
-            ctx.init(new KeyManager[0], new TrustManager[] { new DefaultTrustManager() },
-                     new SecureRandom());
-            SSLContext.setDefault(ctx);
-        } catch (NoSuchAlgorithmException | KeyManagementException e) {
-            System.err.println("Error setting SSL up: " + e.getMessage());
-            e.printStackTrace();
-        }
-        return ctx;
-    }
+//    private String screenNameToID(final String screenName) {
+//        String id = screenName;
+//        try {
+////            HttpPost post = new HttpPost("https://75.119.200.192/ajax.php");
+//            HttpPost post = new HttpPost("https://tweeterid.com/ajax.php");
+//            post.setHeader("User-Agent", this.USER_AGENT);
+//            List<NameValuePair> formparams = new ArrayList<>();
+//            formparams.add(new BasicNameValuePair("input", screenName));
+//            post.setEntity(new UrlEncodedFormEntity(formparams, Consts.UTF_8));
+//
+//            CloseableHttpResponse response = this.httpClient.execute(post);
+//            try {
+//                LOG.info("Status: {}", response.getStatusLine().getStatusCode());
+//                LOG.info("Reason: {}", response.getStatusLine().getReasonPhrase());
+//                HttpEntity entity = response.getEntity();
+//                if (entity != null) {
+//                    long len = entity.getContentLength();
+//                    if (len != -1 && len < 2048) {
+//                        id = EntityUtils.toString(entity);
+//                        System.out.println("Resolved @" + screenName + " -> " + id);
+//                    } else {
+//                        System.err.println("Error converting screen name to ID: Error in response");
+//                        EntityUtils.consume(entity);
+//                        System.err.println("=> " + EntityUtils.toString(entity));
+//                    }
+//                }
+//            } finally {
+//                response.close();
+//            }
+//        } catch (IOException e) {
+//            LOG.warn("Error converting screen name to ID", e);
+//        }
+//        return id;
+//    }
 
 
-    /**
-     * Forgiving trust manager for talking to https://...
-     */
-    private static class DefaultTrustManager implements X509TrustManager {
+//    /**
+//     * A forgiving SSL setup is required for talking to https://tweeterid.com/
+//     * to do reverse-lookups of user IDs to follow.
+//     * <p>
+//     *
+//     * @see <a href=
+//     *      "http://stackoverflow.com/questions/1828775/how-to-handle-invalid-ssl-certificates-with-apache-httpclient">Props
+//     *      to this post for how to do this.</a>
+//     * @return A forgiving SSL context
+//     */
+//    private SSLContext setupSSLCertificates() {
+//        // configure the SSLContext with a TrustManager
+//        SSLContext ctx = null;
+//        try {
+//            ctx = SSLContext.getInstance("TLS");
+//            ctx.init(new KeyManager[0], new TrustManager[] { new DefaultTrustManager() },
+//                     new SecureRandom());
+//            SSLContext.setDefault(ctx);
+//        } catch (NoSuchAlgorithmException | KeyManagementException e) {
+//            System.err.println("Error setting SSL up: " + e.getMessage());
+//            e.printStackTrace();
+//        }
+//        return ctx;
+//    }
 
-        @Override
-        public void checkClientTrusted(X509Certificate[] arg0, String arg1)
-            throws CertificateException {
-        }
 
-        @Override
-        public void checkServerTrusted(X509Certificate[] arg0, String arg1)
-            throws CertificateException {
-        }
-
-        @Override
-        public X509Certificate[] getAcceptedIssuers() {
-            return null;
-        }
-    }
+//    /**
+//     * Forgiving trust manager for talking to https://...
+//     */
+//    private static class DefaultTrustManager implements X509TrustManager {
+//
+//        @Override
+//        public void checkClientTrusted(X509Certificate[] arg0, String arg1)
+//            throws CertificateException {
+//        }
+//
+//        @Override
+//        public void checkServerTrusted(X509Certificate[] arg0, String arg1)
+//            throws CertificateException {
+//        }
+//
+//        @Override
+//        public X509Certificate[] getAcceptedIssuers() {
+//            return null;
+//        }
+//    }
 
 
     private String formatNicely(long epochSecond) {
