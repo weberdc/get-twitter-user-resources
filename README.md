@@ -1,10 +1,12 @@
-# Fetch Twitter profiles in batches
+# Fetch resources associated with each of a list of Twitter IDs
 
-Author: **Derek Weber** (with many thanks to [http://twitter4j.org]() examples)
+Author: **Derek Weber** (with many thanks to [Twitter4J](http://twitter4j.org)
+for their examples)
 
-Last updated: **2016-09-27**
+Last updated: **2016-10-08**
 
-App to retrieve Twitter profiles in batches.
+App to retrieve resources associated with Twitter accounts, such as tweets and
+favourites.
 
 Requirements:
  + Java Development Kit 1.8
@@ -13,6 +15,8 @@ Requirements:
  + [FasterXML](http://wiki.fasterxml.com/JacksonHome) (Apache 2.0 licence)
  + [Google Guava](https://github.com/google/guava) (Apache 2.0 licence)
  + [Commons CLI](https://commons.apache.org/cli) (Apache 2.0 licence)
+ + [SLF4J](http://www.slf4j.org/) (MIT licence)
+ + [log4j 1.2](https://logging.apache.org/log4j/1.2/) (Apache 2.0 licence)
 
 Built with [Gradle 3.0](http://gradle.org).
 
@@ -26,7 +30,7 @@ By running
 
 `$ ./gradlew installDist` or `$ gradlew.bat installDist`
 
-you will create an installable copy of the app in `PROJECT_ROOT/build/get-twitter-profiles`.
+you will create an installable copy of the app in `PROJECT_ROOT/build/get-twitter-user-resources`.
 
 Use the target `distZip` to make a distribution in `PROJECT_ROOT/build/distributions`
 or the target `timestampedDistZip` to add a timestamp to the distribution archive filename.
@@ -51,38 +55,34 @@ the password-related ones commented and the app will ask for the password.
 
 ## Usage
 If you've just downloaded the binary distribution, do this from within the unzipped
-archive (i.e. in the `get-twitter-profiles` directory). Otherwise, if you've just built
-the app from source, do this from within `PROJECT_ROOT/build/install/get-twitter-profiles`:
+archive (i.e. in the `get-twitter-user-resources` directory). Otherwise, if you've
+just built the app from source, do this from within
+`PROJECT_ROOT/build/install/get-twitter-user-resources`:
 <pre>
-Usage: bin/get-twitter-profiles[.bat] [options]
-  Options:
-    -c, --credentials
-       Properties file with Twitter OAuth credentials
-       Default: ./twitter.properties
-    -i, --ids-file
-       Path to a file with Twitter screen names, one per line
-       Default: none
-    -o, --output-directory
-       Path to a directory into which to write the fetched profiles
-       Default: ./output
-    -h, --help
-       Print usage instructions
-       Default: false
-    -debug
-       Debug mode
-       Default: false
+usage: TwitterUserResourcesRetrieverApp
+ -c,--credentials <arg>        File of Twitter credentials (default:
+                               ./twitter.properties)
+ -d,--debug                    Turn on debugging information (default:
+                               false)
+    --favourites               Collect favourites
+    --followers                Collect follower IDs
+    --friends                  Collect friend (followee) IDs
+ -h,--help                     Ask for help with using this tool.
+ -i,--identifiers-file <arg>   File of Twitter screen names
+ -o,--output-directory <arg>   Directory to which to write profiles
+                               (default: ./output)
+    --tweets                   Collect statuses (tweets)
 </pre>
 
-Run the app with the list of screen names you wish to fetch:
+Run the app with the list of Twitter IDs you wish to fetch:
 <pre>
-prompt> bin/get-twitter-profiles --ids-list screennames.txt -o path/to/profiles -debug
+prompt> bin/get-twitter-user-resources -i twitter_ids.txt -o path/to/output --tweets --favourites
 </pre>
 
-This will create a directory `path/to/profiles` and create a file for each
-profile downloaded, with the filename `profile-<profile-id>.json`. Profiles are
-fetched in batches of 100, which is the limit applied by Twitter's relevant
-[API call](https://dev.twitter.com/rest/reference/get/users/lookup).
-
-Attempts have been made to account for Twitter's rate limits, so at times the
-app will pause, waiting until the rate limit has refreshed. It reports how long
-it will wait when it does have to pause.
+This will create a directory `path/to/output` and create files for each of the
+resource types fetched for each of the Twitter IDs, with the filenames
+`<resource-type>-<profile-id>.json` (e.g. `tweets-123.json` and `favourites-123.json`).
+Resources must be fetched as separate API calls for each resource type for each
+Twitter ID - no batch fetching facility is available - therefore, for a modest
+number of IDs, Twitter's rate limits may be invoked quickly, and the app will
+slow down as it deals with them.

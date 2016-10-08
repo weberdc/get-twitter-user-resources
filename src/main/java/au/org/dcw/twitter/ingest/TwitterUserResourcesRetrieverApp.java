@@ -104,7 +104,7 @@ public final class TwitterUserResourcesRetrieverApp {
             OPTIONS.addOption("o", "output-directory", true, "Directory to which to write profiles (default: ./output)");
             OPTIONS.addOption("c", "credentials", true, "File of Twitter credentials (default: ./twitter.properties)");
             OPTIONS.addOption("d", "debug", false, "Turn on debugging information (default: false)");
-            OPTIONS.addOption("?", "help", false, "Ask for help with using this tool.");
+            OPTIONS.addOption("h", "help", false, "Ask for help with using this tool.");
         }
 
         private static OptionBuilder longOpt(String name, String description) {
@@ -160,22 +160,19 @@ public final class TwitterUserResourcesRetrieverApp {
     }
 
     /**
-     * Encapsulates the holy trinity of Twitter API rate limit data.
+     * Twitter API rate limit data.
      */
     public class LimitData {
 
-        /**
-         * The maximum call limit per limiting window.
-         */
+        /** The maximum number of calls per limiting window. */
         public int limit;
 
-        /**
-         * The remaining call limit in the current limiting window.
-         */
+        /** The remaining number of calls within the current limiting window. */
         public int remaining;
 
         /**
-         * The timestamp, as seconds offset in modern Unix era, at which the next limiting window starts.
+         * The timestamp, as seconds offset in the modern Unix era,
+         * at which the next limiting window will begin.
          */
         public long reset;
 
@@ -187,7 +184,8 @@ public final class TwitterUserResourcesRetrieverApp {
 
         @Override
         public String toString() {
-            return "[" + this.remaining + "/" + this.limit + "/" + this.reset + "]";
+            return "Limit data [remaining:" + this.remaining +
+                ",limit:" + this.limit + ",reset:" + this.reset + "]";
         }
     }
 
@@ -199,21 +197,38 @@ public final class TwitterUserResourcesRetrieverApp {
     }
 
     /**
-     * For each API end point, the mutex controlling access to the path. Keys of this map are are a function of end point paths; see
-     * {@link #endpointPathToLimitKey(String)}.
+     * For each API endpoint, hold a mutex controlling access to the path.
+     * The keys of this map are the endpoint paths.
      */
     public Map<String, ReentrantLock> limitsMutex;
 
     /**
-     * Map from API end point to limit data for that endpoint. Keys of this map are are a function of end point paths; see
-     * {@link #endpointPathToLimitKey(String)}.
+     * Map from API endpoint to limit data known for that endpoint.
+     * Keys of this map are the endpoint paths.
      */
     public Map<String, LimitData> limits;
-//    private CloseableHttpClient httpClient;
+
+    /**
+     * {@link Config Configuration} as specified via the command line.
+     */
     private final Config cfg;
+
+    /**
+     * An ObjectMapper for parsing JSON.
+     */
     private final ObjectMapper json;
+
+    /**
+     * The Twitter API instance, used to communicate with Twitter.
+     */
     private Twitter twitter;
 
+    /**
+     * A simple callback interface.
+     *
+     * @param <Arg1> The type of the single argument to the callback.
+     * @param <RetType> The return type from this callback's {@link #apply(Object)} method.
+     */
     @FunctionalInterface
     interface ApiCall<Arg1, RetType> {
         public RetType apply(Arg1 arg1);
@@ -240,18 +255,14 @@ public final class TwitterUserResourcesRetrieverApp {
      */
     public void run() throws IOException, TwitterException {
 
-        LOG.info("Collecting profiles");
-        LOG.info("  Twitter identifiers: " + this.cfg.identifiersFile);
-        LOG.info("  output directory: " + this.cfg.outputDir);
-        LOG.info("  Collecting tweets:     " + this.cfg.collectTweets);
-        LOG.info("  Collecting favourites: " + this.cfg.collectFaves);
-        LOG.info("  Collecting followers:  " + this.cfg.collectFollowers);
-        LOG.info("  Collecting friends:    " + this.cfg.collectFriends);
+        LOG.info("Collecting resources for Twitter ids in: " + this.cfg.identifiersFile);
+        LOG.info("* output directory: " + this.cfg.outputDir);
+        LOG.info("* tweets:     " + this.cfg.collectTweets);
+        LOG.info("* favourites: " + this.cfg.collectFaves);
+        LOG.info("* followers:  " + this.cfg.collectFollowers);
+        LOG.info("* friends:    " + this.cfg.collectFriends);
 
-//        this.httpClient =
-//            HttpClientBuilder.create().setSSLContext(this.setupSSLCertificates()).build();
-
-        final List<String> ids = this.loadIDs(this.cfg.identifiersFile);
+        final List<Long> ids = this.loadIDs(this.cfg.identifiersFile);
 
         LOG.info("Read {} Twitter IDs", ids.size());
 
@@ -262,25 +273,21 @@ public final class TwitterUserResourcesRetrieverApp {
             Paths.get(this.cfg.outputDir).toFile().mkdirs();
         }
 
-        final Configuration config =
-            TwitterUserResourcesRetrieverApp.buildTwitterConfiguration(this.cfg.credentialsFile, this.cfg.debug);
-        this.twitter = new TwitterFactory(config).getInstance();
+        this.twitter = this.establishTwitterConnection();
 
-        this.retrieveRateLimits(this.twitter);
-
-        for (final String userId : ids) {
+        for (final Long userId : ids) {
 
             try {
                 LOG.info("Looking up {}'s resources", userId);
-                final long idAsLong = Long.parseLong(userId);
+                //final long idAsLong = Long.parseLong(userId);
 
                 // Retrieve tweets
                 if (this.cfg.collectTweets) {
-                    this.makeApiCall(idAsLong, GET_TWEETS, this.createGetTweetsCallback());
+                    this.makeApiCall(userId, GET_TWEETS, this.createGetTweetsCallback());
                 }
                 // Retrieve favourites
                 if (this.cfg.collectFaves) {
-                    this.makeApiCall(idAsLong, GET_FAVES, this.createGetFavesCallback());
+                    this.makeApiCall(userId, GET_FAVES, this.createGetFavesCallback());
                 }
                 // Retrieve followers
                 if (this.cfg.collectFollowers) {
@@ -300,6 +307,29 @@ public final class TwitterUserResourcesRetrieverApp {
     }
 
 
+    /**
+     * Reads in Twitter config and credentials, establishes a connection to Twitter and then
+     * retrieves the current rate limits for the required endpoints.
+     *
+     * @return A {@link Twitter} instance ready for use.
+     * @throws IOException If there is an issue talking to the disk or the network.
+     * @throws TwitterException If there is an issue talking with Twitter.
+     */
+    private Twitter establishTwitterConnection() throws IOException, TwitterException {
+        final Configuration config = twitterConfig(this.cfg.credentialsFile, this.cfg.debug);
+        final Twitter twitter = new TwitterFactory(config).getInstance();
+
+        this.retrieveRateLimits(twitter);
+
+        return twitter;
+    }
+
+
+    /**
+     * Creates a callback to a Twitter API call to fetch the tweets for a given ID.
+     *
+     * @return An {@link ApiCall} instance.
+     */
     private ApiCall<Long, RateLimitStatus> createGetTweetsCallback() {
         ApiCall<Long, RateLimitStatus> callback = (Long id) -> {
             try {
@@ -327,6 +357,11 @@ public final class TwitterUserResourcesRetrieverApp {
     }
 
 
+    /**
+     * Creates a callback to a Twitter API call to fetch the favourite tweets for a given ID.
+     *
+     * @return An {@link ApiCall} instance.
+     */
     private ApiCall<Long, RateLimitStatus> createGetFavesCallback() {
         ApiCall<Long, RateLimitStatus> callback = (Long id) -> {
             try {
@@ -354,6 +389,11 @@ public final class TwitterUserResourcesRetrieverApp {
     }
 
 
+//    /**
+//     * Creates a callback to a Twitter API call to fetch a batch of followers for a given ID.
+//     *
+//     * @return An {@link ApiCall} instance.
+//     */
 //    private ApiCall<Long, RateLimitStatus> createGetFollowersCallback() {
 //        ApiCall<Long, RateLimitStatus> callback = (Long id) -> {
 //            try {
@@ -396,28 +436,28 @@ public final class TwitterUserResourcesRetrieverApp {
         final String endpoint,
         final ApiCall<Long, RateLimitStatus> callback
     ) throws InterruptedException {
-        LOG.debug("Acquiring mutex for limit key {}", endpoint);
+        this.debug("Acquiring mutex for endpoint {}.", endpoint);
         this.limitsMutex.get(endpoint).lockInterruptibly();
         try {
-            LOG.debug("Acquired mutex for limit key {}", endpoint);
+            this.debug("Acquired mutex for endpoint {}.", endpoint);
             LimitData limitData = this.limits.get(endpoint);
-            LOG.debug("There are {} remaining calls to {}", limitData.remaining, endpoint);
+            this.debug("There are {} remaining calls to {}.", limitData.remaining, endpoint);
             if (limitData.remaining == 0) {
                 // Fudge added to the advertised reset time to guard against local sleep duration
                 // jitter and clock skew between local clock and Twitter's clock.
                 long sleepDurationMillis =
                     limitData.reset * 1000 - System.currentTimeMillis() + SLEEP_DURATION_FUDGE_AMOUNT;
                 if (sleepDurationMillis > 0) {
-                    LOG.debug(
-                        "Sleeping {} seconds to get past reset timestamp {}.",
+                    this.debug(
+                        "Sleeping {} seconds to get past the reset timestamp {}.",
                         sleepDurationMillis / 1000f,
                         this.formatNicely(limitData.reset)
                     );
                     Thread.sleep(sleepDurationMillis);
-                    LOG.debug("And I'm back.");
+                    this.debug("Wait for {} over. Starting again.", endpoint);
                 } else {
-                    LOG.debug(
-                        "But the limit for {} will have reset by now : reset timestamp is {}.",
+                    this.debug(
+                        "However, the limit for {} should have reset by now (timestamp is {}).",
                         endpoint, this.formatNicely(limitData.reset)
                     );
                 }
@@ -427,105 +467,32 @@ public final class TwitterUserResourcesRetrieverApp {
 
             if (rls != null) {
                 limitData.remaining = rls.getRemaining();
-                LOG.debug("Endpoint {} has {} calls remaining.", endpoint, limitData.remaining);
+                this.debug("Endpoint {} has {} calls remaining.", endpoint, limitData.remaining);
                 limitData.reset = rls.getResetTimeInSeconds();
-                LOG.debug("Endpoint {} has a new reset time: {}.", endpoint, limitData.reset);
+                this.debug("Endpoint {} has a new reset time: {}.", endpoint, limitData.reset);
             }
 
         } finally {
             this.limitsMutex.get(endpoint).unlock();
-            LOG.debug("Released mutex for limit key {}", endpoint);
+            if (this.cfg.debug)
+                this.debug("Released mutex for limit key {}", endpoint);
         }
+    }
+
+    private void debug(String format, Object... values) {
+        if (this.cfg.debug) LOG.info(format, values);
     }
 
     private String outFile(String filename) {
         return this.cfg.outputDir + FILE_SEPARATOR + filename;
     }
 
-//    private String screenNameToID(final String screenName) {
-//        String id = screenName;
-//        try {
-////            HttpPost post = new HttpPost("https://75.119.200.192/ajax.php");
-//            HttpPost post = new HttpPost("https://tweeterid.com/ajax.php");
-//            post.setHeader("User-Agent", this.USER_AGENT);
-//            List<NameValuePair> formparams = new ArrayList<>();
-//            formparams.add(new BasicNameValuePair("input", screenName));
-//            post.setEntity(new UrlEncodedFormEntity(formparams, Consts.UTF_8));
-//
-//            CloseableHttpResponse response = this.httpClient.execute(post);
-//            try {
-//                LOG.info("Status: {}", response.getStatusLine().getStatusCode());
-//                LOG.info("Reason: {}", response.getStatusLine().getReasonPhrase());
-//                HttpEntity entity = response.getEntity();
-//                if (entity != null) {
-//                    long len = entity.getContentLength();
-//                    if (len != -1 && len < 2048) {
-//                        id = EntityUtils.toString(entity);
-//                        System.out.println("Resolved @" + screenName + " -> " + id);
-//                    } else {
-//                        System.err.println("Error converting screen name to ID: Error in response");
-//                        EntityUtils.consume(entity);
-//                        System.err.println("=> " + EntityUtils.toString(entity));
-//                    }
-//                }
-//            } finally {
-//                response.close();
-//            }
-//        } catch (IOException e) {
-//            LOG.warn("Error converting screen name to ID", e);
-//        }
-//        return id;
-//    }
 
-
-//    /**
-//     * A forgiving SSL setup is required for talking to https://tweeterid.com/
-//     * to do reverse-lookups of user IDs to follow.
-//     * <p>
-//     *
-//     * @see <a href=
-//     *      "http://stackoverflow.com/questions/1828775/how-to-handle-invalid-ssl-certificates-with-apache-httpclient">Props
-//     *      to this post for how to do this.</a>
-//     * @return A forgiving SSL context
-//     */
-//    private SSLContext setupSSLCertificates() {
-//        // configure the SSLContext with a TrustManager
-//        SSLContext ctx = null;
-//        try {
-//            ctx = SSLContext.getInstance("TLS");
-//            ctx.init(new KeyManager[0], new TrustManager[] { new DefaultTrustManager() },
-//                     new SecureRandom());
-//            SSLContext.setDefault(ctx);
-//        } catch (NoSuchAlgorithmException | KeyManagementException e) {
-//            System.err.println("Error setting SSL up: " + e.getMessage());
-//            e.printStackTrace();
-//        }
-//        return ctx;
-//    }
-
-
-//    /**
-//     * Forgiving trust manager for talking to https://...
-//     */
-//    private static class DefaultTrustManager implements X509TrustManager {
-//
-//        @Override
-//        public void checkClientTrusted(X509Certificate[] arg0, String arg1)
-//            throws CertificateException {
-//        }
-//
-//        @Override
-//        public void checkServerTrusted(X509Certificate[] arg0, String arg1)
-//            throws CertificateException {
-//        }
-//
-//        @Override
-//        public X509Certificate[] getAcceptedIssuers() {
-//            return null;
-//        }
-//    }
-
-
+    /**
+     * Formats an epoch second nicely as a human-readable date/timestamp.
+     * @param epochSecond The epoch second to render readable.
+     * @return A human-readable date/timestamp.
+     */
     private String formatNicely(long epochSecond) {
         return DateTimeFormatter.ISO_OFFSET_DATE_TIME.format(
             ZonedDateTime.ofInstant(Instant.ofEpochSecond(epochSecond), ZoneId.systemDefault())
@@ -533,22 +500,38 @@ public final class TwitterUserResourcesRetrieverApp {
     }
 
 
+    /**
+     * Retrieve the current Twitter rate limits and populate the
+     * {@link #limits} and {@link #limitsMutex} maps.
+     *
+     * @param twitter The connection to Twitter.
+     * @throws TwitterException If an error occurs talking with Twitter.
+     */
     private void retrieveRateLimits(Twitter twitter) throws TwitterException {
         this.limitsMutex = Maps.newConcurrentMap();
         this.limits = Maps.newConcurrentMap();
         Map<String, RateLimitStatus> rateLimitStatuses = twitter.getRateLimitStatus(
-            "statuses",  // for "/statuses/user_timeline",
-            "favorites", // for "/favorites/list",
-            "followers", // for "/followers/ids",
-            "friends"    // for "/friends/ids"
+            "statuses",  // endpoint family for "/statuses/user_timeline",
+            "favorites", // endpoint family for "/favorites/list",
+            "followers", // endpoint family for "/followers/ids",
+            "friends"    // endpoint family for "/friends/ids"
         );
         rateLimitStatuses.forEach((endpoint, rls) -> {
             this.limitsMutex.put(endpoint, new ReentrantLock(true));
-            this.limits.put(endpoint, new LimitData(rls.getLimit(), rls.getRemaining(), rls.getResetTimeInSeconds()));
-            LOG.debug("Resource: {} -> {}", endpoint, this.limits.get(endpoint));
+            this.limits.put(endpoint, this.limitDataFrom(rls));
+            this.debug("Endpoint: {} -> {}", endpoint, this.limits.get(endpoint));
         });
+    }
 
 
+    /**
+     * Creates a {@link LimitData} from a {@link RateLimitStatus}.
+     *
+     * @param rls The RateLimitStatus to convert.
+     * @return A LimitData corresponding to the given RateLimitStatus.
+     */
+    private LimitData limitDataFrom(RateLimitStatus rls) {
+        return new LimitData(rls.getLimit(), rls.getRemaining(), rls.getResetTimeInSeconds());
     }
 
     /**
@@ -567,28 +550,45 @@ public final class TwitterUserResourcesRetrieverApp {
         }
     }
 
-    private List<String> loadIDs(final String idsFile) throws IOException {
+
+    /**
+     * Reads Twitter IDs (expected to be longs) from the given
+     * <code>idsFile</code> into a list. IDs are listed in the file
+     * as one ID per line. Lines starting with '#' will be ignored.
+     * Content on a line following a '#' will be ignored. Example file:
+     * <pre>
+     * # Twitter ID file
+     * 123 # @pippin
+     * 456 # @merry
+     * 789 # @sam
+     * 101 # @frodo
+     * </pre>
+     *
+     * @param idsFile Path to a file with Twitter IDs (long values)
+     * @return A list of Twitter IDs.
+     * @throws IOException If there's an issue reading the file or parsing the IDs.
+     */
+    private List<Long> loadIDs(final String idsFile) throws IOException {
         return Files.readAllLines(Paths.get(idsFile)).stream()
             .map(l -> l.split("#")[0].trim())
             .filter(l -> l.length() > 0 && ! l.startsWith("#"))
-//            .map(sn -> (sn.startsWith("@") ? sn.substring(1): sn))
+            .map(Long::parseLong)
             .collect(Collectors.toList());
     }
 
     /**
      * Builds the {@link Configuration} object with which to connect to Twitter,
-     * including credentials and proxy information if it's specified.
+     * including credentials and looks for proxy information in
+     * <code>proxy.properties</code> if it's present.
      *
      * @param credentialsFile Property file of Twitter credentials.
      * @param debug Debug flag to pass to Twitter4j's config builder.
-     * @return a Twitter4j {@link Configuration} object
+     * @return a Twitter4j {@link Configuration} object.
      * @throws IOException if there's an error loading the application's
      *         {@link #credentialsFile}.
      */
-    private static Configuration buildTwitterConfiguration
+    private static Configuration twitterConfig
         (final String credentialsFile, final boolean debug) throws IOException {
-        // TODO find a better name than credentials, given it might contain
-        // proxy info
         final Properties credentials = loadCredentials(credentialsFile);
 
         final ConfigurationBuilder conf = new ConfigurationBuilder();
@@ -624,7 +624,8 @@ public final class TwitterUserResourcesRetrieverApp {
 
     /**
      * Loads proxy properties from {@code ./proxy.properties} and, if a password
-     * is not supplied, asks for it in the console.
+     * is not supplied, asks for it in the console. The properties collected are
+     * also shunted into the System properties object.
      *
      * @return A Properties instance filled with proxy information.
      */
