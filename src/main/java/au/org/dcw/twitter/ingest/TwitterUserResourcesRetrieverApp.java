@@ -80,17 +80,20 @@ import twitter4j.conf.Configuration;
 import twitter4j.conf.ConfigurationBuilder;
 
 /**
- * Application that collects the profiles of Twitter users.
+ * Application that collects resources associated with Twitter users,
+ * such as the most recent tweets, most recent favourites, friend and
+ * follower IDs.
  * <p>
  *
  * @see <a href=
  *      "https://github.com/yusuke/twitter4j/blob/master/twitter4j-examples/src/main/java/twitter4j/examples/json/SaveRawJSON.java">SaveRawJSON.java</a>
  * @see <a href=
  *      "https://dev.twitter.com/rest/reference/get/statuses/user_timeline">Twitter's
- *      <code>GET status/user_timeline</code> endpoint</a>
+ *      <code>GET status/user_timeline</code> endpoint for tweets</a>
  */
 @SuppressWarnings("static-access")
 public final class TwitterUserResourcesRetrieverApp {
+    private static final String FILE_SEPARATOR = System.getProperty("file.separator", "/");
     /**
      * This fudge amount (milliseconds) is added to the time a thread goes to
      * sleep when it needs to wait until the next rate limiting window. This is
@@ -197,7 +200,7 @@ public final class TwitterUserResourcesRetrieverApp {
 
         @Override
         public String toString() {
-            return "[" + remaining + "/" + limit + "/" + reset + "]";
+            return "[" + this.remaining + "/" + this.limit + "/" + this.reset + "]";
         }
     }
 
@@ -205,7 +208,7 @@ public final class TwitterUserResourcesRetrieverApp {
         Config cfg = Config.parse(args);
         cfg.check();
 
-        new TwitterUserResourcesRetrieverApp().run(cfg);
+        new TwitterUserResourcesRetrieverApp(cfg).run();
     }
 
     /**
@@ -220,129 +223,106 @@ public final class TwitterUserResourcesRetrieverApp {
      */
     public Map<String, LimitData> limits;
     private CloseableHttpClient httpClient;
+    private Config cfg;
 
     @FunctionalInterface
-    interface ApiCall<Arg1, Arg2, RetType> {
-        public RetType apply(Arg1 arg1, Arg2 arg2);
+    interface ApiCall<Arg1, RetType> {
+        public RetType apply(Arg1 arg1);
     }
+
+
+    /**
+     * Constructor.
+     *
+     * @param cfg Config instance with all required configuration.
+     */
+    public TwitterUserResourcesRetrieverApp(final Config cfg) {
+        this.cfg = cfg;
+    }
+
+
     /**
      * Fetch the profiles specified by the screen names in the given {@code screenNamesFile}
      * and write the profiles to the given {@code outputDir}.
      *
-     * @param cfg Config instance with all required configuration.
      * @throws IOException If an error occurs reading files or talking to the network
      * @throws TwitterException If an error occurs haggling with Twitter
      */
-    public void run(final Config cfg) throws IOException, TwitterException {
+    public void run() throws IOException, TwitterException {
 
         LOG.info("Collecting profiles");
-        LOG.info("  Twitter identifiers: " + cfg.identifiersFile);
-        LOG.info("  output directory: " + cfg.outputDir);
-        LOG.info("  Collecting tweets:     " + cfg.collectTweets);
-        LOG.info("  Collecting favourites: " + cfg.collectFaves);
-        LOG.info("  Collecting followers:  " + cfg.collectFollowers);
-        LOG.info("  Collecting friends:    " + cfg.collectFriends);
+        LOG.info("  Twitter identifiers: " + this.cfg.identifiersFile);
+        LOG.info("  output directory: " + this.cfg.outputDir);
+        LOG.info("  Collecting tweets:     " + this.cfg.collectTweets);
+        LOG.info("  Collecting favourites: " + this.cfg.collectFaves);
+        LOG.info("  Collecting followers:  " + this.cfg.collectFollowers);
+        LOG.info("  Collecting friends:    " + this.cfg.collectFriends);
 
         this.httpClient =
             HttpClientBuilder.create().setSSLContext(this.setupSSLCertificates()).build();
 
-        final List<String> screenNames = this.loadScreenNames(cfg.identifiersFile);
+        final List<String> ids = this.loadIDs(this.cfg.identifiersFile);
 
-        LOG.info("Read {} screen names", screenNames.size());
+        LOG.info("Read {} Twitter IDs", ids.size());
 
-        if (!Files.exists(Paths.get(cfg.outputDir))) {
-            LOG.info("Creating output directory {}", cfg.outputDir);
-            Paths.get(cfg.outputDir).toFile().mkdirs();
+        if (!Files.exists(Paths.get(this.cfg.outputDir))) {
+            LOG.info("Creating output directory {}", this.cfg.outputDir);
+            Paths.get(this.cfg.outputDir).toFile().mkdirs();
         }
 
         final Configuration config =
-            TwitterUserResourcesRetrieverApp.buildTwitterConfiguration(cfg.credentialsFile, cfg.debug);
+            TwitterUserResourcesRetrieverApp.buildTwitterConfiguration(this.cfg.credentialsFile, this.cfg.debug);
         final Twitter twitter = new TwitterFactory(config).getInstance();
 
         this.retrieveRateLimits(twitter);
 
         final ObjectMapper json = new ObjectMapper();
 
-        for (final String screenName : screenNames) {
+        for (final String userId : ids) {
 
             try {
-                LOG.info("Looking up @{}'s resources", screenName);
-                final String userId = this.screenNameToID(screenName);
-                LOG.info("@{} -> ID {}", screenName, userId);
+                LOG.info("Looking up {}'s resources", userId);
+                final long idAsLong = Long.parseLong(userId);//this.screenNameToID(id);
+//                LOG.info("@{} -> ID {}", id, userId);
 
                 // Retrieve tweets
-                if (cfg.collectTweets) {
-                    final String limitKey = GET_TWEETS;
-                    LOG.info("Collecting Tweets by @{} with {}", screenName, limitKey);
-                    ApiCall<Twitter, String, RateLimitStatus> callback = (Twitter tw, String sn) -> {
+                if (this.cfg.collectTweets) {
+                    LOG.info("Collecting Tweets by account {} with {}", userId, GET_TWEETS);
+                    ApiCall<Long, RateLimitStatus> callback = (Long id) -> {
                         try {
-                            final ResponseList<Status> userTimeline = tw.getUserTimeline(sn, new Paging(1, 200));
+                            final ResponseList<Status> userTimeline = twitter.getUserTimeline(id.longValue(), new Paging(1, 200));
                             // extract raw json and write it to file
                             final String rawJsonTweets = TwitterObjectFactory.getRawJSON(userTimeline);
+//                            saveText(rawJsonTweets, cfg.outputDir + "/tmp.json");
                             final StringBuilder tweetsToSave = new StringBuilder();
+                            int i = 0;
                             for (JsonNode tweetNode : json.readTree(rawJsonTweets)) {
-                                tweetsToSave.append(tweetNode.asText()).append('\n');
+                                i++;
+                                tweetsToSave.append(tweetNode.toString()).append('\n');
                             }
-                            saveText(tweetsToSave.toString(), userId + "-tweets.json");
+                            String tweetsFile = this.outFile(id.toString() + "-tweets.json");
+                            saveText(tweetsToSave.toString(), tweetsFile);
+                            LOG.info("Wrote {} tweets to {}", i, tweetsFile);
                             return userTimeline.getRateLimitStatus();
                         } catch (IOException | TwitterException e) {
-                            LOG.warn("Barfed parsing JSON or saving to file tweets for {}.", screenName, e);
+                            LOG.warn("Barfed parsing JSON or saving to file tweets for {}.", id, e);
                         }
                         return null;
                     };
 
-                    LOG.debug("Acquiring mutex for limit key {}", limitKey);
-                    limitsMutex.get(limitKey).lockInterruptibly();
-                    try {
-                        LOG.debug("Acquired mutex for limit key {}", limitKey);
-                        LimitData limitData = limits.get(limitKey);
-                        LOG.debug("There are {} remaining calls to {}", limitData.remaining, limitKey);
-                        if (limitData.remaining == 0) {
-                            // Fudge added to the advertised reset time to guard against local sleep duration
-                            // jitter and clock skew between local clock and Twitter's clock.
-                            long sleepDurationMillis =
-                                limitData.reset * 1000 - System.currentTimeMillis() + SLEEP_DURATION_FUDGE_AMOUNT;
-                            if (sleepDurationMillis > 0) {
-                                LOG.debug(
-                                    "Sleeping {} seconds to get past reset timestamp {}.",
-                                    sleepDurationMillis / 1000f,
-                                    formatNicely(limitData.reset)
-                                );
-                                Thread.sleep(sleepDurationMillis);
-                                LOG.debug("And I'm back.");
-                            } else {
-                                LOG.debug(
-                                    "But the limit for {} will have reset by now : reset timestamp is {}.",
-                                    limitKey, formatNicely(limitData.reset)
-                                );
-                            }
-                        }
-
-                        RateLimitStatus rls = callback.apply(twitter, screenName);
-
-                        if (rls != null) {
-                            limitData.remaining = rls.getRemaining();
-                            LOG.debug("Endpoint {} has {} calls remaining.", limitKey, limitData.remaining);
-                            limitData.reset = rls.getResetTimeInSeconds();
-                            LOG.debug("Endpoint {} has a new reset time: {}.", limitKey, limitData.reset);
-                        }
-
-                    } finally {
-                        limitsMutex.get(limitKey).unlock();
-                        LOG.debug("Released mutex for limit key {}", limitKey);
-                    }
+                    this.makeApiCall(idAsLong, GET_TWEETS, callback);
 
                 }
                 // Retrieve favourites
-                if (cfg.collectFaves) {
+                if (this.cfg.collectFaves) {
 
                 }
                 // Retrieve followers
-                if (cfg.collectFollowers) {
+                if (this.cfg.collectFollowers) {
 
                 }
                 // Retrieve friends
-                if (cfg.collectFriends) {
+                if (this.cfg.collectFriends) {
 
                 }
 //
@@ -377,6 +357,67 @@ public final class TwitterUserResourcesRetrieverApp {
         }
     }
 
+
+    /**
+     * Invokes the Twitter <code>endpoint</code> with the given
+     * <code>twitterId</code> and <code>callback</code> taking into
+     * account Twitter rate limits.
+     *
+     * @param twitterId The Twitter ID argument for the endpoint.
+     * @param endpoint The Twitter RESTful endpoint being invoked.
+     * @param callback The callback to execute when the endpoint invocation returns.
+     * @throws InterruptedException If we're interrupted while awaiting a response.
+     */
+    private void makeApiCall(
+        final long twitterId,
+        final String endpoint,
+        final ApiCall<Long, RateLimitStatus> callback
+    ) throws InterruptedException {
+        LOG.debug("Acquiring mutex for limit key {}", endpoint);
+        this.limitsMutex.get(endpoint).lockInterruptibly();
+        try {
+            LOG.debug("Acquired mutex for limit key {}", endpoint);
+            LimitData limitData = this.limits.get(endpoint);
+            LOG.debug("There are {} remaining calls to {}", limitData.remaining, endpoint);
+            if (limitData.remaining == 0) {
+                // Fudge added to the advertised reset time to guard against local sleep duration
+                // jitter and clock skew between local clock and Twitter's clock.
+                long sleepDurationMillis =
+                    limitData.reset * 1000 - System.currentTimeMillis() + SLEEP_DURATION_FUDGE_AMOUNT;
+                if (sleepDurationMillis > 0) {
+                    LOG.debug(
+                        "Sleeping {} seconds to get past reset timestamp {}.",
+                        sleepDurationMillis / 1000f,
+                        this.formatNicely(limitData.reset)
+                    );
+                    Thread.sleep(sleepDurationMillis);
+                    LOG.debug("And I'm back.");
+                } else {
+                    LOG.debug(
+                        "But the limit for {} will have reset by now : reset timestamp is {}.",
+                        endpoint, this.formatNicely(limitData.reset)
+                    );
+                }
+            }
+
+            RateLimitStatus rls = callback.apply(twitterId);
+
+            if (rls != null) {
+                limitData.remaining = rls.getRemaining();
+                LOG.debug("Endpoint {} has {} calls remaining.", endpoint, limitData.remaining);
+                limitData.reset = rls.getResetTimeInSeconds();
+                LOG.debug("Endpoint {} has a new reset time: {}.", endpoint, limitData.reset);
+            }
+
+        } finally {
+            this.limitsMutex.get(endpoint).unlock();
+            LOG.debug("Released mutex for limit key {}", endpoint);
+        }
+    }
+
+    private String outFile(String filename) {
+        return this.cfg.outputDir + FILE_SEPARATOR + filename;
+    }
 
     private String screenNameToID(final String screenName) {
         String id = screenName;
@@ -479,9 +520,9 @@ public final class TwitterUserResourcesRetrieverApp {
             "friends"    // for "/friends/ids"
         );
         rateLimitStatuses.forEach((endpoint, rls) -> {
-            limitsMutex.put(endpoint, new ReentrantLock(true));
-            limits.put(endpoint, new LimitData(rls.getLimit(), rls.getRemaining(), rls.getResetTimeInSeconds()));
-            LOG.debug("Resource: {} -> {}", endpoint, limits.get(endpoint));
+            this.limitsMutex.put(endpoint, new ReentrantLock(true));
+            this.limits.put(endpoint, new LimitData(rls.getLimit(), rls.getRemaining(), rls.getResetTimeInSeconds()));
+            LOG.debug("Resource: {} -> {}", endpoint, this.limits.get(endpoint));
         });
 
 
@@ -503,11 +544,11 @@ public final class TwitterUserResourcesRetrieverApp {
         }
     }
 
-    private List<String> loadScreenNames(final String screenNamesFile) throws IOException {
-        return Files.readAllLines(Paths.get(screenNamesFile)).stream()
-            .map(l -> l.trim())
+    private List<String> loadIDs(final String idsFile) throws IOException {
+        return Files.readAllLines(Paths.get(idsFile)).stream()
+            .map(l -> l.split("#")[0].trim())
             .filter(l -> l.length() > 0 && ! l.startsWith("#"))
-            .map(sn -> (sn.startsWith("@") ? sn.substring(1): sn))
+//            .map(sn -> (sn.startsWith("@") ? sn.substring(1): sn))
             .collect(Collectors.toList());
     }
 
