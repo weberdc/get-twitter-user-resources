@@ -362,6 +362,7 @@ public final class TwitterUserResourcesRetrieverApp {
                 // Retrieve friends
                 if (this.cfg.collectFriends) {
                     LOG.info("Collecting accounts followed by #{} with {} - NYI", userId, GET_FRIENDS);
+                    fetchAndPersistFriends(userId);
                     LOG.info("Collected accounts followed by #{}", userId);
                 }
 
@@ -371,6 +372,7 @@ public final class TwitterUserResourcesRetrieverApp {
         }
         LOG.info("Retrieval complete in {} seconds.", timer.elapsed(TimeUnit.SECONDS));
     }
+
 
     @SuppressWarnings("unchecked")
     private void fetchAndPersistFollowers(final Long userId) throws InterruptedException {
@@ -399,6 +401,37 @@ public final class TwitterUserResourcesRetrieverApp {
 
         } catch (IOException e) {
             LOG.warn("Failed to write to {}", followersFile, e);
+        }
+    }
+
+
+    @SuppressWarnings("unchecked")
+    private void fetchAndPersistFriends(final Long userId) throws InterruptedException {
+        final String friendsFile = outFile(userId + "-friends.txt");
+        try (BufferedWriter out = Files.newBufferedWriter(
+            Paths.get(friendsFile),
+            StandardOpenOption.CREATE,
+            StandardOpenOption.WRITE,
+            StandardOpenOption.TRUNCATE_EXISTING
+        )) {
+            long cursor = -1, prevCursor = -1;
+            List<Long> friends = Collections.emptyList();
+            do {
+                final ApiCall<Long, ApiCallResponse> callback = this.createGetFriendsCallback(cursor);
+                IDsApiCallResponse resp = (IDsApiCallResponse) this.makeApiCall(userId, GET_FRIENDS, callback);
+                prevCursor = cursor;
+                cursor = resp.nextCursor;
+                friends = (List<Long>) resp.payload;
+
+                LOG.info("Collected {} friends, starting at cursor {}", friends.size(), prevCursor);
+
+                for (Long id : friends) {
+                    out.append(id.toString() + "\n").flush();
+                }
+            } while (! friends.isEmpty());
+
+        } catch (IOException e) {
+            LOG.warn("Failed to write to {}", friendsFile, e);
         }
     }
 
@@ -505,16 +538,6 @@ public final class TwitterUserResourcesRetrieverApp {
                 for (long l : response.getIDs()) {
                     batchOfIDs.add(Long.valueOf(l));
                 }
-                // extract raw json and write it to file
-//                final String rawJsonIDs = TwitterObjectFactory.getRawJSON(followerIDs);
-//                final StringBuilder favesToSave = new StringBuilder();
-//                for (JsonNode tweetNode : this.json.readTree(rawJsonIDs)) {
-//                    i++;
-//                    favesToSave.append(tweetNode.toString()).append('\n');
-//                }
-//                String favesFile = this.outFile(id.toString() + "-followers.json");
-//                saveText(favesToSave.toString(), favesFile);
-//                LOG.info("Wrote {} favourites to {}", i, favesFile);
                 return new IDsApiCallResponse(
                     response.getRateLimitStatus(),
                     batchOfIDs,
@@ -522,7 +545,38 @@ public final class TwitterUserResourcesRetrieverApp {
                     response.getPreviousCursor(),
                     null);
             } catch (TwitterException e) {
-                LOG.warn("Barfed parsing JSON or saving to file favourites for {}.", id, e);
+                LOG.warn("Barfed parsing JSON or saving to file followers for {}.", id, e);
+                return new IDsApiCallResponse(null, batchOfIDs, cursor, cursor, e);
+            }
+        };
+        return callback;
+    }
+
+
+    /**
+     * Creates a callback to a Twitter API call to fetch a batch of friends (followees)
+     * (starting at <code>cursor</code>, which should be -1 to begin) for a given ID.
+     *
+     * @param cursor The cursor to start the batch of followers to request (use -1 to start).
+     * @return An {@link ApiCallResponse} instance.
+     */
+    private ApiCall<Long, ApiCallResponse> createGetFriendsCallback(final long cursor) {
+        ApiCall<Long, ApiCallResponse> callback = (Long id) -> {
+            List<Long> batchOfIDs = Lists.newArrayList();
+            try {
+                LOG.info("Collecting friends of account {} with {}", id, GET_FRIENDS);
+                final IDs response = this.twitter.getFriendsIDs(id.longValue(), cursor);
+                for (long l : response.getIDs()) {
+                    batchOfIDs.add(Long.valueOf(l));
+                }
+                return new IDsApiCallResponse(
+                    response.getRateLimitStatus(),
+                    batchOfIDs,
+                    response.getNextCursor(),
+                    response.getPreviousCursor(),
+                    null);
+            } catch (TwitterException e) {
+                LOG.warn("Barfed parsing JSON or saving to file friends of {}.", id, e);
                 return new IDsApiCallResponse(null, batchOfIDs, cursor, cursor, e);
             }
         };
