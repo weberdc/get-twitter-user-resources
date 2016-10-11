@@ -27,6 +27,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -50,6 +51,7 @@ import com.google.common.base.Stopwatch;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 
+import twitter4j.IDs;
 import twitter4j.Paging;
 import twitter4j.RateLimitStatus;
 import twitter4j.ResponseList;
@@ -199,12 +201,17 @@ public final class TwitterUserResourcesRetrieverApp {
         public final RateLimitStatus rls;
 
         /** The records retrieved, of whatever type required (e.g. JsonNodes). */
-        public final List<Object> payload;
+        public final List<? extends Object> payload;
 
         /** The error thrown if the API call failed null if it succeeded. */
         public final Throwable error;
 
-        public ApiCallResponse(final RateLimitStatus status, final List<Object> retrieved, final Throwable error) {
+        @SuppressWarnings("unchecked")
+        public ApiCallResponse(
+            final RateLimitStatus status,
+            final List<? extends Object> retrieved,
+            final Throwable error
+        ) {
             this.rls = status;
             this.payload = retrieved;
             this.error = error;
@@ -221,6 +228,23 @@ public final class TwitterUserResourcesRetrieverApp {
 
     private static ApiCallResponse apiCallError(Throwable error, List<Object> retrieved) {
         return new ApiCallResponse(null, retrieved, error);
+    }
+
+    public static class IDsApiCallResponse extends ApiCallResponse {
+        public final long nextCursor;
+        public final long prevCursor;
+
+        public IDsApiCallResponse(
+            final RateLimitStatus status,
+            final List<Long> retrievedIDs,
+            final long nextCursor,
+            final long prevCursor,
+            final Throwable error
+        ) {
+            super(status, retrievedIDs, error);
+            this.prevCursor = prevCursor;
+            this.nextCursor = nextCursor;
+        }
     }
 
     public static void main(String[] args) throws IOException, TwitterException {
@@ -287,6 +311,7 @@ public final class TwitterUserResourcesRetrieverApp {
      * @throws IOException If an error occurs reading files or talking to the network
      * @throws TwitterException If an error occurs haggling with Twitter
      */
+    @SuppressWarnings("unchecked")
     public void run() throws IOException, TwitterException {
 
         LOG.info("Collecting resources for Twitter ids in: " + this.cfg.identifiersFile);
@@ -317,18 +342,31 @@ public final class TwitterUserResourcesRetrieverApp {
 
                 // Retrieve tweets
                 if (this.cfg.collectTweets) {
-                    List<Object> tweets = this.makeApiCall(userId, GET_TWEETS, this.createGetTweetsCallback(1));
+                    List<JsonNode> tweets =
+                        (List<JsonNode>) this.makeApiCall(userId, GET_TWEETS, this.createGetTweetsCallback(1)).payload;
                     LOG.info("Retrieved {} tweets", tweets.size());
                 }
                 // Retrieve favourites
                 if (this.cfg.collectFaves) {
-                    List<Object> faves = this.makeApiCall(userId, GET_FAVES, this.createGetFavesCallback(1));
+                    List<JsonNode> faves =
+                        (List<JsonNode>) this.makeApiCall(userId, GET_FAVES, this.createGetFavesCallback(1)).payload;
                     LOG.info("Retrieved {} tweets", faves.size());
                 }
                 // Retrieve followers
                 if (this.cfg.collectFollowers) {
                     LOG.info("Collecting followers of #{} with {} - NYI", userId, GET_FOLLOWERS);
-//                    this.makeApiCall(idAsLong, GET_FOLLOWERS, this.createGetFollowersCallback());
+                    long cursor = -1, prevCursor = -1;
+                    List<Long> followers = Collections.emptyList();
+                    do {
+                        final ApiCall<Long, ApiCallResponse> callback = this.createGetFollowersCallback(cursor);
+                        IDsApiCallResponse resp = (IDsApiCallResponse) this.makeApiCall(userId, GET_FOLLOWERS, callback);
+                        prevCursor = cursor;
+                        cursor = resp.nextCursor;
+                        followers = (List<Long>) resp.payload;
+
+                        LOG.info("Collected {} followers, starting at cursor {}", followers.size(), prevCursor);
+
+                    } while (! followers.isEmpty());
                 }
                 // Retrieve friends
                 if (this.cfg.collectFriends) {
@@ -429,36 +467,45 @@ public final class TwitterUserResourcesRetrieverApp {
     }
 
 
-//    /**
-//     * Creates a callback to a Twitter API call to fetch a batch of followers for a given ID.
-//     *
-//     * @return An {@link ApiCall} instance.
-//     */
-//    private ApiCall<Long, RateLimitStatus> createGetFollowersCallback() {
-//        ApiCall<Long, RateLimitStatus> callback = (Long id) -> {
-//            try {
-//                LOG.info("Collecting followers of account {} with {}", id, GET_FOLLOWERS);
-//                final ResponseList<Status> userTimeline =
-//                    this.twitter.getFavorites(id.longValue(), new Paging(1, 200));
-//                // extract raw json and write it to file
-//                final String rawJsonTweets = TwitterObjectFactory.getRawJSON(userTimeline);
+    /**
+     * Creates a callback to a Twitter API call to fetch a batch of followers
+     * (starting at <code>cursor</code>, which should be -1 to begin) for a given ID.
+     *
+     * @param cursor The cursor to start the batch of followers to request (use -1 to start).
+     * @return An {@link ApiCallResponse} instance.
+     */
+    private ApiCall<Long, ApiCallResponse> createGetFollowersCallback(final long cursor) {
+        ApiCall<Long, ApiCallResponse> callback = (Long id) -> {
+            List<Long> batchOfIDs = Lists.newArrayList();
+            try {
+                LOG.info("Collecting followers of account {} with {}", id, GET_FOLLOWERS);
+                final IDs response = this.twitter.getFollowersIDs(id.longValue(), cursor);
+                for (long l : response.getIDs()) {
+                    batchOfIDs.add(Long.valueOf(l));
+                }
+                // extract raw json and write it to file
+//                final String rawJsonIDs = TwitterObjectFactory.getRawJSON(followerIDs);
 //                final StringBuilder favesToSave = new StringBuilder();
-//                int i = 0;
-//                for (JsonNode tweetNode : this.json.readTree(rawJsonTweets)) {
+//                for (JsonNode tweetNode : this.json.readTree(rawJsonIDs)) {
 //                    i++;
 //                    favesToSave.append(tweetNode.toString()).append('\n');
 //                }
 //                String favesFile = this.outFile(id.toString() + "-followers.json");
 //                saveText(favesToSave.toString(), favesFile);
 //                LOG.info("Wrote {} favourites to {}", i, favesFile);
-//                return userTimeline.getRateLimitStatus();
-//            } catch (IOException | TwitterException e) {
-//                LOG.warn("Barfed parsing JSON or saving to file favourites for {}.", id, e);
-//            }
-//            return null;
-//        };
-//        return callback;
-//    }
+                return new IDsApiCallResponse(
+                    response.getRateLimitStatus(),
+                    batchOfIDs,
+                    response.getNextCursor(),
+                    response.getPreviousCursor(),
+                    null);
+            } catch (TwitterException e) {
+                LOG.warn("Barfed parsing JSON or saving to file favourites for {}.", id, e);
+                return new IDsApiCallResponse(null, batchOfIDs, cursor, cursor, e);
+            }
+        };
+        return callback;
+    }
 
 
     /**
@@ -472,7 +519,7 @@ public final class TwitterUserResourcesRetrieverApp {
      * @return Records retrieved by the API call.
      * @throws InterruptedException If we're interrupted while awaiting a response.
      */
-    private List<Object> makeApiCall(
+    private ApiCallResponse makeApiCall(
         final long twitterId,
         final String endpoint,
         final ApiCall<Long, ApiCallResponse> callback
@@ -489,13 +536,14 @@ public final class TwitterUserResourcesRetrieverApp {
                 long sleepDurationMillis =
                     limitData.reset * 1000 - System.currentTimeMillis() + SLEEP_DURATION_FUDGE_AMOUNT;
                 if (sleepDurationMillis > 0) {
-                    this.debug(
-                        "Sleeping {} seconds to get past the reset timestamp {}.",
+                    LOG.info(
+                        "Sleeping {} seconds to get past the reset timestamp {} for endpoint {}.",
                         sleepDurationMillis / 1000f,
-                        this.formatNicely(limitData.reset)
+                        this.formatNicely(limitData.reset),
+                        endpoint
                     );
                     Thread.sleep(sleepDurationMillis);
-                    this.debug("Wait for {} over. Starting again.", endpoint);
+                    LOG.info("Wait for {} over. Starting again.", endpoint);
                 } else {
                     this.debug(
                         "However, the limit for {} should have reset by now (timestamp is {}).",
@@ -514,7 +562,7 @@ public final class TwitterUserResourcesRetrieverApp {
                 this.debug("Endpoint {} has a new reset time: {}.", endpoint, limitData.reset);
             }
 
-            return resp.payload;
+            return resp;
 
         } finally {
             this.limitsMutex.get(endpoint).unlock();
