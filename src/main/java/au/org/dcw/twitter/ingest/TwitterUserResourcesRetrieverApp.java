@@ -23,6 +23,7 @@ import java.io.OutputStreamWriter;
 import java.io.Reader;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
@@ -354,23 +355,14 @@ public final class TwitterUserResourcesRetrieverApp {
                 }
                 // Retrieve followers
                 if (this.cfg.collectFollowers) {
-                    LOG.info("Collecting followers of #{} with {} - NYI", userId, GET_FOLLOWERS);
-                    long cursor = -1, prevCursor = -1;
-                    List<Long> followers = Collections.emptyList();
-                    do {
-                        final ApiCall<Long, ApiCallResponse> callback = this.createGetFollowersCallback(cursor);
-                        IDsApiCallResponse resp = (IDsApiCallResponse) this.makeApiCall(userId, GET_FOLLOWERS, callback);
-                        prevCursor = cursor;
-                        cursor = resp.nextCursor;
-                        followers = (List<Long>) resp.payload;
-
-                        LOG.info("Collected {} followers, starting at cursor {}", followers.size(), prevCursor);
-
-                    } while (! followers.isEmpty());
+                    LOG.info("Collecting followers of #{} with {}", userId, GET_FOLLOWERS);
+                    fetchAndPersistFollowers(userId);
+                    LOG.info("Collected followers of #{}", userId);
                 }
                 // Retrieve friends
                 if (this.cfg.collectFriends) {
                     LOG.info("Collecting accounts followed by #{} with {} - NYI", userId, GET_FRIENDS);
+                    LOG.info("Collected accounts followed by #{}", userId);
                 }
 
             } catch (InterruptedException e) {
@@ -378,6 +370,36 @@ public final class TwitterUserResourcesRetrieverApp {
             }
         }
         LOG.info("Retrieval complete in {} seconds.", timer.elapsed(TimeUnit.SECONDS));
+    }
+
+    @SuppressWarnings("unchecked")
+    private void fetchAndPersistFollowers(final Long userId) throws InterruptedException {
+        final String followersFile = outFile(userId + "-followers.txt");
+        try (BufferedWriter out = Files.newBufferedWriter(
+            Paths.get(followersFile),
+            StandardOpenOption.CREATE,
+            StandardOpenOption.WRITE,
+            StandardOpenOption.TRUNCATE_EXISTING
+        )) {
+            long cursor = -1, prevCursor = -1;
+            List<Long> followers = Collections.emptyList();
+            do {
+                final ApiCall<Long, ApiCallResponse> callback = this.createGetFollowersCallback(cursor);
+                IDsApiCallResponse resp = (IDsApiCallResponse) this.makeApiCall(userId, GET_FOLLOWERS, callback);
+                prevCursor = cursor;
+                cursor = resp.nextCursor;
+                followers = (List<Long>) resp.payload;
+
+                LOG.info("Collected {} followers, starting at cursor {}", followers.size(), prevCursor);
+
+                for (Long id : followers) {
+                    out.append(id.toString() + "\n").flush();
+                }
+            } while (! followers.isEmpty());
+
+        } catch (IOException e) {
+            LOG.warn("Failed to write to {}", followersFile, e);
+        }
     }
 
 
