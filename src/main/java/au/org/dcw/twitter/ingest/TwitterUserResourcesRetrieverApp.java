@@ -189,6 +189,34 @@ public final class TwitterUserResourcesRetrieverApp {
         }
     }
 
+    public static class ApiCallResponse {
+        public final RateLimitStatus rls;
+        public final int retrieved;
+        public final Throwable error;
+
+        public ApiCallResponse(RateLimitStatus status, int retrieved) {
+            this(status, retrieved, null);
+        }
+
+        public ApiCallResponse(RateLimitStatus status, int retrieved, Throwable error) {
+            this.rls = status;
+            this.retrieved = retrieved;
+            this.error = error;
+        }
+
+        public boolean succeeded() {
+            return error == null;
+        }
+    }
+
+    private static ApiCallResponse apiCallSuccess(RateLimitStatus rls, int retrieved) {
+        return new ApiCallResponse(rls, retrieved);
+    }
+
+    private static ApiCallResponse apiCallError(Throwable error, int retrieved) {
+        return new ApiCallResponse(null, retrieved, error);
+    }
+
     public static void main(String[] args) throws IOException, TwitterException {
         Config cfg = Config.parse(args);
         cfg.check();
@@ -230,7 +258,7 @@ public final class TwitterUserResourcesRetrieverApp {
      * @param <RetType> The return type from this callback's {@link #apply(Object)} method.
      */
     @FunctionalInterface
-    interface ApiCall<Arg1, RetType> {
+    interface ApiCall<Arg1, RetType extends ApiCallResponse> {
         public RetType apply(Arg1 arg1);
     }
 
@@ -283,11 +311,13 @@ public final class TwitterUserResourcesRetrieverApp {
 
                 // Retrieve tweets
                 if (this.cfg.collectTweets) {
-                    this.makeApiCall(userId, GET_TWEETS, this.createGetTweetsCallback());
+                    int tweets = this.makeApiCall(userId, GET_TWEETS, this.createGetTweetsCallback());
+                    LOG.info("Retrieved {} tweets", tweets);
                 }
                 // Retrieve favourites
                 if (this.cfg.collectFaves) {
-                    this.makeApiCall(userId, GET_FAVES, this.createGetFavesCallback());
+                    int faves = this.makeApiCall(userId, GET_FAVES, this.createGetFavesCallback());
+                    LOG.info("Retrieved {} tweets", faves);
                 }
                 // Retrieve followers
                 if (this.cfg.collectFollowers) {
@@ -328,10 +358,11 @@ public final class TwitterUserResourcesRetrieverApp {
     /**
      * Creates a callback to a Twitter API call to fetch the tweets for a given ID.
      *
-     * @return An {@link ApiCall} instance.
+     * @return An {@link ApiCallResponse} instance.
      */
-    private ApiCall<Long, RateLimitStatus> createGetTweetsCallback() {
-        ApiCall<Long, RateLimitStatus> callback = (Long id) -> {
+    private ApiCall<Long, ApiCallResponse> createGetTweetsCallback() {
+        ApiCall<Long, ApiCallResponse> callback = (Long id) -> {
+            int tweetsRetrieved = 0;
             try {
                 LOG.info("Collecting tweets posted by #{} with {}", id, GET_TWEETS);
                 final ResponseList<Status> userTimeline =
@@ -339,19 +370,18 @@ public final class TwitterUserResourcesRetrieverApp {
                 // extract raw json and write it to file
                 final String rawJsonTweets = TwitterObjectFactory.getRawJSON(userTimeline);
                 final StringBuilder tweetsToSave = new StringBuilder();
-                int i = 0;
                 for (JsonNode tweetNode : this.json.readTree(rawJsonTweets)) {
-                    i++;
+                    tweetsRetrieved++;
                     tweetsToSave.append(tweetNode.toString()).append('\n');
                 }
                 String tweetsFile = this.outFile(id.toString() + "-tweets.json");
                 saveText(tweetsToSave.toString(), tweetsFile);
-                LOG.info("Wrote {} tweets to {}", i, tweetsFile);
-                return userTimeline.getRateLimitStatus();
+                LOG.info("Wrote {} tweets to {}", tweetsRetrieved, tweetsFile);
+                return apiCallSuccess(userTimeline.getRateLimitStatus(), tweetsRetrieved);
             } catch (IOException | TwitterException e) {
                 LOG.warn("Barfed parsing JSON or saving to file tweets for {}.", id, e);
+                return apiCallError(e, tweetsRetrieved);
             }
-            return null;
         };
         return callback;
     }
@@ -360,10 +390,11 @@ public final class TwitterUserResourcesRetrieverApp {
     /**
      * Creates a callback to a Twitter API call to fetch the favourite tweets for a given ID.
      *
-     * @return An {@link ApiCall} instance.
+     * @return An {@link ApiCallResponse} instance.
      */
-    private ApiCall<Long, RateLimitStatus> createGetFavesCallback() {
-        ApiCall<Long, RateLimitStatus> callback = (Long id) -> {
+    private ApiCall<Long, ApiCallResponse> createGetFavesCallback() {
+        ApiCall<Long, ApiCallResponse> callback = (Long id) -> {
+            int favesRetrieved = 0;
             try {
                 LOG.info("Collecting tweets favourited by #{} with {}", id, GET_FAVES);
                 final ResponseList<Status> favesTimeline =
@@ -371,19 +402,18 @@ public final class TwitterUserResourcesRetrieverApp {
                 // extract raw json and write it to file
                 final String rawJsonTweets = TwitterObjectFactory.getRawJSON(favesTimeline);
                 final StringBuilder favesToSave = new StringBuilder();
-                int i = 0;
                 for (JsonNode tweetNode : this.json.readTree(rawJsonTweets)) {
-                    i++;
+                    favesRetrieved++;
                     favesToSave.append(tweetNode.toString()).append('\n');
                 }
                 String favesFile = this.outFile(id.toString() + "-favourites.json");
                 saveText(favesToSave.toString(), favesFile);
-                LOG.info("Wrote {} favourites to {}", i, favesFile);
-                return favesTimeline.getRateLimitStatus();
+                LOG.info("Wrote {} favourites to {}", favesRetrieved, favesFile);
+                return apiCallSuccess(favesTimeline.getRateLimitStatus(), favesRetrieved);
             } catch (IOException | TwitterException e) {
                 LOG.warn("Barfed parsing JSON or saving to file favourites for {}.", id, e);
+                return apiCallError(e, favesRetrieved);
             }
-            return null;
         };
         return callback;
     }
@@ -429,12 +459,13 @@ public final class TwitterUserResourcesRetrieverApp {
      * @param twitterId The Twitter ID argument for the endpoint.
      * @param endpoint The Twitter RESTful endpoint being invoked.
      * @param callback The callback to execute when the endpoint invocation returns.
+     * @return Number of records retrieved by the API call.
      * @throws InterruptedException If we're interrupted while awaiting a response.
      */
-    private void makeApiCall(
+    private int makeApiCall(
         final long twitterId,
         final String endpoint,
-        final ApiCall<Long, RateLimitStatus> callback
+        final ApiCall<Long, ApiCallResponse> callback
     ) throws InterruptedException {
         this.debug("Acquiring mutex for endpoint {}.", endpoint);
         this.limitsMutex.get(endpoint).lockInterruptibly();
@@ -463,19 +494,21 @@ public final class TwitterUserResourcesRetrieverApp {
                 }
             }
 
-            RateLimitStatus rls = callback.apply(twitterId);
+            ApiCallResponse resp = callback.apply(twitterId);
 
-            if (rls != null) {
+            if (resp.succeeded()) {
+                RateLimitStatus rls = resp.rls;
                 limitData.remaining = rls.getRemaining();
                 this.debug("Endpoint {} has {} calls remaining.", endpoint, limitData.remaining);
                 limitData.reset = rls.getResetTimeInSeconds();
                 this.debug("Endpoint {} has a new reset time: {}.", endpoint, limitData.reset);
             }
 
+            return resp.retrieved;
+
         } finally {
             this.limitsMutex.get(endpoint).unlock();
-            if (this.cfg.debug)
-                this.debug("Released mutex for limit key {}", endpoint);
+            this.debug("Released mutex for limit key {}", endpoint);
         }
     }
 
