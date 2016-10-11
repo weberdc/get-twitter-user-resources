@@ -47,6 +47,7 @@ import org.slf4j.LoggerFactory;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Stopwatch;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 
 import twitter4j.Paging;
@@ -189,18 +190,23 @@ public final class TwitterUserResourcesRetrieverApp {
         }
     }
 
+    /**
+     * Class to package up the response to a call to the Twitter Api.
+     */
     public static class ApiCallResponse {
+
+        /** The RateLimitStatus returned by the API call, if successful. */
         public final RateLimitStatus rls;
-        public final int retrieved;
+
+        /** The records retrieved, of whatever type required (e.g. JsonNodes). */
+        public final List<Object> payload;
+
+        /** The error thrown if the API call failed null if it succeeded. */
         public final Throwable error;
 
-        public ApiCallResponse(RateLimitStatus status, int retrieved) {
-            this(status, retrieved, null);
-        }
-
-        public ApiCallResponse(RateLimitStatus status, int retrieved, Throwable error) {
+        public ApiCallResponse(final RateLimitStatus status, final List<Object> retrieved, final Throwable error) {
             this.rls = status;
-            this.retrieved = retrieved;
+            this.payload = retrieved;
             this.error = error;
         }
 
@@ -209,11 +215,11 @@ public final class TwitterUserResourcesRetrieverApp {
         }
     }
 
-    private static ApiCallResponse apiCallSuccess(RateLimitStatus rls, int retrieved) {
-        return new ApiCallResponse(rls, retrieved);
+    private static ApiCallResponse apiCallSuccess(RateLimitStatus rls, List<Object> retrieved) {
+        return new ApiCallResponse(rls, retrieved, null);
     }
 
-    private static ApiCallResponse apiCallError(Throwable error, int retrieved) {
+    private static ApiCallResponse apiCallError(Throwable error, List<Object> retrieved) {
         return new ApiCallResponse(null, retrieved, error);
     }
 
@@ -311,13 +317,13 @@ public final class TwitterUserResourcesRetrieverApp {
 
                 // Retrieve tweets
                 if (this.cfg.collectTweets) {
-                    int tweets = this.makeApiCall(userId, GET_TWEETS, this.createGetTweetsCallback());
-                    LOG.info("Retrieved {} tweets", tweets);
+                    List<Object> tweets = this.makeApiCall(userId, GET_TWEETS, this.createGetTweetsCallback(1));
+                    LOG.info("Retrieved {} tweets", tweets.size());
                 }
                 // Retrieve favourites
                 if (this.cfg.collectFaves) {
-                    int faves = this.makeApiCall(userId, GET_FAVES, this.createGetFavesCallback());
-                    LOG.info("Retrieved {} tweets", faves);
+                    List<Object> faves = this.makeApiCall(userId, GET_FAVES, this.createGetFavesCallback(1));
+                    LOG.info("Retrieved {} tweets", faves.size());
                 }
                 // Retrieve followers
                 if (this.cfg.collectFollowers) {
@@ -356,27 +362,29 @@ public final class TwitterUserResourcesRetrieverApp {
 
 
     /**
-     * Creates a callback to a Twitter API call to fetch the tweets for a given ID.
+     * Creates a callback to a Twitter API call to fetch the specified page
+     * (starting at 1) of tweets for a given ID, in batches of 200.
      *
+     * @param pageNo The page of results to request (starting at 1).
      * @return An {@link ApiCallResponse} instance.
      */
-    private ApiCall<Long, ApiCallResponse> createGetTweetsCallback() {
+    private ApiCall<Long, ApiCallResponse> createGetTweetsCallback(final int pageNo) {
         ApiCall<Long, ApiCallResponse> callback = (Long id) -> {
-            int tweetsRetrieved = 0;
+            List<Object> tweetsRetrieved = Lists.newArrayList();
             try {
                 LOG.info("Collecting tweets posted by #{} with {}", id, GET_TWEETS);
                 final ResponseList<Status> userTimeline =
-                    this.twitter.getUserTimeline(id.longValue(), new Paging(1, 200));
+                    this.twitter.getUserTimeline(id.longValue(), new Paging(pageNo, 200));
                 // extract raw json and write it to file
                 final String rawJsonTweets = TwitterObjectFactory.getRawJSON(userTimeline);
                 final StringBuilder tweetsToSave = new StringBuilder();
                 for (JsonNode tweetNode : this.json.readTree(rawJsonTweets)) {
-                    tweetsRetrieved++;
+                    tweetsRetrieved.add(tweetNode);
                     tweetsToSave.append(tweetNode.toString()).append('\n');
                 }
                 String tweetsFile = this.outFile(id.toString() + "-tweets.json");
                 saveText(tweetsToSave.toString(), tweetsFile);
-                LOG.info("Wrote {} tweets to {}", tweetsRetrieved, tweetsFile);
+                LOG.info("Wrote {} tweets to {}", tweetsRetrieved.size(), tweetsFile);
                 return apiCallSuccess(userTimeline.getRateLimitStatus(), tweetsRetrieved);
             } catch (IOException | TwitterException e) {
                 LOG.warn("Barfed parsing JSON or saving to file tweets for {}.", id, e);
@@ -388,27 +396,29 @@ public final class TwitterUserResourcesRetrieverApp {
 
 
     /**
-     * Creates a callback to a Twitter API call to fetch the favourite tweets for a given ID.
+     * Creates a callback to a Twitter API call to fetch the specified page
+     * (starting at 1) of favourite tweets for a given ID, in batches of 200.
      *
+     * @param pageNo The page of results to request (starting at 1).
      * @return An {@link ApiCallResponse} instance.
      */
-    private ApiCall<Long, ApiCallResponse> createGetFavesCallback() {
+    private ApiCall<Long, ApiCallResponse> createGetFavesCallback(final int pageNo) {
         ApiCall<Long, ApiCallResponse> callback = (Long id) -> {
-            int favesRetrieved = 0;
+            List<Object> favesRetrieved = Lists.newArrayList();
             try {
                 LOG.info("Collecting tweets favourited by #{} with {}", id, GET_FAVES);
                 final ResponseList<Status> favesTimeline =
-                    this.twitter.getFavorites(id.longValue(), new Paging(1, 200));
+                    this.twitter.getFavorites(id.longValue(), new Paging(pageNo, 200));
                 // extract raw json and write it to file
                 final String rawJsonTweets = TwitterObjectFactory.getRawJSON(favesTimeline);
                 final StringBuilder favesToSave = new StringBuilder();
                 for (JsonNode tweetNode : this.json.readTree(rawJsonTweets)) {
-                    favesRetrieved++;
+                    favesRetrieved.add(tweetNode);
                     favesToSave.append(tweetNode.toString()).append('\n');
                 }
                 String favesFile = this.outFile(id.toString() + "-favourites.json");
                 saveText(favesToSave.toString(), favesFile);
-                LOG.info("Wrote {} favourites to {}", favesRetrieved, favesFile);
+                LOG.info("Wrote {} favourites to {}", favesRetrieved.size(), favesFile);
                 return apiCallSuccess(favesTimeline.getRateLimitStatus(), favesRetrieved);
             } catch (IOException | TwitterException e) {
                 LOG.warn("Barfed parsing JSON or saving to file favourites for {}.", id, e);
@@ -459,10 +469,10 @@ public final class TwitterUserResourcesRetrieverApp {
      * @param twitterId The Twitter ID argument for the endpoint.
      * @param endpoint The Twitter RESTful endpoint being invoked.
      * @param callback The callback to execute when the endpoint invocation returns.
-     * @return Number of records retrieved by the API call.
+     * @return Records retrieved by the API call.
      * @throws InterruptedException If we're interrupted while awaiting a response.
      */
-    private int makeApiCall(
+    private List<Object> makeApiCall(
         final long twitterId,
         final String endpoint,
         final ApiCall<Long, ApiCallResponse> callback
@@ -504,7 +514,7 @@ public final class TwitterUserResourcesRetrieverApp {
                 this.debug("Endpoint {} has a new reset time: {}.", endpoint, limitData.reset);
             }
 
-            return resp.retrieved;
+            return resp.payload;
 
         } finally {
             this.limitsMutex.get(endpoint).unlock();
