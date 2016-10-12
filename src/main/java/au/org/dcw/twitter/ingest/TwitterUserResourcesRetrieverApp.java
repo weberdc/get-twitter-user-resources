@@ -17,9 +17,7 @@ package au.org.dcw.twitter.ingest;
 
 import java.io.BufferedWriter;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.OutputStreamWriter;
 import java.io.Reader;
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -80,7 +78,6 @@ import twitter4j.conf.ConfigurationBuilder;
  */
 @SuppressWarnings("static-access")
 public final class TwitterUserResourcesRetrieverApp {
-    private static final String FILE_SEPARATOR = System.getProperty("file.separator", "/");
     /**
      * This fudge amount (milliseconds) is added to the time a thread goes to
      * sleep when it needs to wait until the next rate limiting window. This is
@@ -89,22 +86,30 @@ public final class TwitterUserResourcesRetrieverApp {
      * reasonable amount.
      */
     private static final int SLEEP_DURATION_FUDGE_AMOUNT = 10000;
-//    private static final String USER_AGENT = "Mozilla/5.0";
+
+    /**
+     * The maximum number of statuses (tweets) to request when asking for timeline
+     * tweets or favourites from Twitter (as specified by Twitter's API docs).
+     */
+    private static final int TWEET_BATCH_SIZE = 200;
 
     private static final String GET_TWEETS = "/statuses/home_timeline";
     private static final String GET_FAVES = "/favorites/list";
     private static final String GET_FOLLOWERS = "/followers/ids";
     private static final String GET_FRIENDS = "/friends/ids";
 
-    private static Logger LOG = LoggerFactory.getLogger(TwitterUserResourcesRetrieverApp.class);
-//    private static final int FETCH_BATCH_SIZE = 100;
+    private static final String FILE_SEPARATOR = System.getProperty("file.separator", "/");
+    private static final Logger LOG = LoggerFactory.getLogger(TwitterUserResourcesRetrieverApp.class);
 
+    /** Class for managing command line options to this application. */
     static class Config {
         private static final Options OPTIONS = new Options();
         static {
             OPTIONS.addOption("i", "identifiers-file", true, "File of Twitter screen names");
             OPTIONS.addOption(longOpt("tweets", "Collect statuses (tweets)").create());
-            OPTIONS.addOption(longOpt("favourites", "Collect favourites").create());
+            OPTIONS.addOption(longOpt("target-tweet-count", "Collect at least this many statuses (tweets) (default: 200)").hasArg().create());
+            OPTIONS.addOption(longOpt("favourites", "Collect favourited statuses").create());
+            OPTIONS.addOption(longOpt("target-favourite-count", "Collect at least this many favourited statuses (default: 200)").hasArg().create());
             OPTIONS.addOption(longOpt("followers", "Collect follower IDs").create());
             OPTIONS.addOption(longOpt("friends", "Collect friend (followee) IDs").create());
             OPTIONS.addOption("o", "output-directory", true, "Directory to which to write profiles (default: ./output)");
@@ -117,34 +122,39 @@ public final class TwitterUserResourcesRetrieverApp {
             return OptionBuilder.withLongOpt(name).withDescription(description);
         }
 
-        /**
-         * Prints how the app ought to be used and causes the VM to exit.
-         */
+        /** Prints how the app ought to be used and causes the VM to exit. */
         private static void printUsageAndExit() {
             new HelpFormatter().printHelp("TwitterUserResourcesRetrieverApp", OPTIONS);
             System.exit(0);
         }
 
-        String identifiersFile = null;
-        boolean expectIDs = false;
-        boolean collectTweets = false;
-        boolean collectFaves = false;
-        boolean collectFollowers = false;
-        boolean collectFriends = false;
-        String outputDir = "./output";
-        String credentialsFile = "./twitter.properties";
-        boolean debug = false;
+        private String idsFile = null;
+        private boolean fetchTweets = false;
+        private int numTweetsToFetch = 200;
+        private boolean fetchFaves = false;
+        private int numFavouritesToFetch = 200;
+        private boolean fetchFollowers = false;
+        private boolean fetchFriends = false;
+        private String outputDir = "./output";
+        private String credentialsFile = "./twitter.properties";
+        private boolean debug = false;
 
         static Config parse(String[] args) {
             final CommandLineParser parser = new BasicParser();
             Config cfg = new Config();
             try {
                 final CommandLine cmd = parser.parse(OPTIONS, args);
-                if (cmd.hasOption('i')) cfg.identifiersFile = cmd.getOptionValue('i');
-                if (cmd.hasOption("tweets")) cfg.collectTweets = true; // 200
-                if (cmd.hasOption("favourites")) cfg.collectFaves = true; // nom 200
-                if (cmd.hasOption("followers")) cfg.collectFollowers = true;
-                if (cmd.hasOption("friends")) cfg.collectFriends = true;
+                if (cmd.hasOption('i')) cfg.idsFile = cmd.getOptionValue('i');
+                if (cmd.hasOption("tweets")) cfg.fetchTweets = true;
+                if (cmd.hasOption("target-tweet-count")) { // 200 by default
+                    cfg.numTweetsToFetch = Integer.parseInt(cmd.getOptionValue("target-tweet-count"));
+                }
+                if (cmd.hasOption("favourites")) cfg.fetchFaves = true;
+                if (cmd.hasOption("target-favourite-count")) { // 200 by default
+                    cfg.numFavouritesToFetch = Integer.parseInt(cmd.getOptionValue("target-favourite-count"));
+                }
+                if (cmd.hasOption("followers")) cfg.fetchFollowers = true;
+                if (cmd.hasOption("friends")) cfg.fetchFriends = true;
                 if (cmd.hasOption('o')) cfg.outputDir = cmd.getOptionValue('o');
                 if (cmd.hasOption('c')) cfg.credentialsFile = cmd.getOptionValue('c');
                 if (cmd.hasOption('d')) cfg.debug = true;
@@ -156,18 +166,13 @@ public final class TwitterUserResourcesRetrieverApp {
         }
 
         public void check() {
-            if (this.debug) {
-                System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "DEBUG");
-            }
-            if (this.identifiersFile == null) {
+            if (this.idsFile == null) {
                 printUsageAndExit();
             }
         }
     }
 
-    /**
-     * Twitter API rate limit data.
-     */
+    /** Twitter API rate limit data. */
     public class LimitData {
 
         /** The maximum number of calls per limiting window. */
@@ -190,14 +195,14 @@ public final class TwitterUserResourcesRetrieverApp {
 
         @Override
         public String toString() {
-            return "Limit data [remaining:" + this.remaining +
-                ",limit:" + this.limit + ",reset:" + this.reset + "]";
+            return String.format(
+                "Limit data [remaining:%d,limit:%d,reset:%d",
+                this.remaining, this.limit, this.reset
+            );
         }
     }
 
-    /**
-     * Class to package up the response to a call to the Twitter Api.
-     */
+    /** Class to package up the response to a call to the Twitter API. */
     public static class ApiCallResponse {
 
         /** The RateLimitStatus returned by the API call, if successful. */
@@ -209,7 +214,6 @@ public final class TwitterUserResourcesRetrieverApp {
         /** The error thrown if the API call failed null if it succeeded. */
         public final Throwable error;
 
-        @SuppressWarnings("unchecked")
         public ApiCallResponse(
             final RateLimitStatus status,
             final List<? extends Object> retrieved,
@@ -220,8 +224,8 @@ public final class TwitterUserResourcesRetrieverApp {
             this.error = error;
         }
 
-        public boolean succeeded() {
-            return error == null;
+        public boolean hasARateLimitStatusUpdate() {
+            return this.rls != null;
         }
     }
 
@@ -231,6 +235,10 @@ public final class TwitterUserResourcesRetrieverApp {
 
     private static ApiCallResponse apiCallError(Throwable error, List<Object> retrieved) {
         return new ApiCallResponse(null, retrieved, error);
+    }
+
+    private static ApiCallResponse apiCallError(RateLimitStatus rls, List<Object> retrieved, Throwable error) {
+        return new ApiCallResponse(rls, retrieved, error);
     }
 
     public static class IDsApiCallResponse extends ApiCallResponse {
@@ -314,17 +322,16 @@ public final class TwitterUserResourcesRetrieverApp {
      * @throws IOException If an error occurs reading files or talking to the network
      * @throws TwitterException If an error occurs haggling with Twitter
      */
-    @SuppressWarnings("unchecked")
     public void run() throws IOException, TwitterException {
 
-        LOG.info("Collecting resources for Twitter ids in: " + this.cfg.identifiersFile);
+        LOG.info("Collecting resources for Twitter ids in: " + this.cfg.idsFile);
         LOG.info("* output directory: " + this.cfg.outputDir);
-        LOG.info("* tweets:     " + this.cfg.collectTweets);
-        LOG.info("* favourites: " + this.cfg.collectFaves);
-        LOG.info("* followers:  " + this.cfg.collectFollowers);
-        LOG.info("* friends:    " + this.cfg.collectFriends);
+        LOG.info("* tweets:     " + this.cfg.fetchTweets);
+        LOG.info("* favourites: " + this.cfg.fetchFaves);
+        LOG.info("* followers:  " + this.cfg.fetchFollowers);
+        LOG.info("* friends:    " + this.cfg.fetchFriends);
 
-        final List<Long> ids = this.loadIDs(this.cfg.identifiersFile);
+        final List<Long> ids = this.loadIDs(this.cfg.idsFile);
 
         LOG.info("Read {} Twitter IDs", ids.size());
 
@@ -341,30 +348,41 @@ public final class TwitterUserResourcesRetrieverApp {
 
             try {
                 LOG.info("Looking up {}'s resources", userId);
-                //final long idAsLong = Long.parseLong(userId);
 
                 // Retrieve tweets
-                if (this.cfg.collectTweets) {
-                    List<JsonNode> tweets =
-                        (List<JsonNode>) this.makeApiCall(userId, GET_TWEETS, this.createGetTweetsCallback(1)).payload;
-                    LOG.info("Retrieved {} tweets", tweets.size());
+                if (this.cfg.fetchTweets) {
+                    LOG.info("Collecting tweets by #{} with {}", userId, GET_FOLLOWERS);
+
+                    fetchAndPersistTweets(
+                        userId, "tweets", GET_TWEETS, cfg.numTweetsToFetch, this::createGetTweetsCallback
+                    );
+
+                    LOG.info("Collected tweets of #{}", userId);
                 }
                 // Retrieve favourites
-                if (this.cfg.collectFaves) {
-                    List<JsonNode> faves =
-                        (List<JsonNode>) this.makeApiCall(userId, GET_FAVES, this.createGetFavesCallback(1)).payload;
-                    LOG.info("Retrieved {} tweets", faves.size());
+                if (this.cfg.fetchFaves) {
+                    LOG.info("Collecting favourites made by #{} with {}", userId, GET_FOLLOWERS);
+
+                    fetchAndPersistTweets(
+                        userId, "favourites", GET_FAVES, cfg.numFavouritesToFetch, this::createGetFavesCallback
+                    );
+
+                    LOG.info("Collected favourites of #{}", userId);
                 }
                 // Retrieve followers
-                if (this.cfg.collectFollowers) {
+                if (this.cfg.fetchFollowers) {
                     LOG.info("Collecting followers of #{} with {}", userId, GET_FOLLOWERS);
-                    fetchAndPersistFollowers(userId);
+
+                    fetchAndPersistIDs(userId, "followers", GET_FOLLOWERS, this::createGetFollowersCallback);
+
                     LOG.info("Collected followers of #{}", userId);
                 }
                 // Retrieve friends
-                if (this.cfg.collectFriends) {
+                if (this.cfg.fetchFriends) {
                     LOG.info("Collecting accounts followed by #{} with {} - NYI", userId, GET_FRIENDS);
-                    fetchAndPersistFriends(userId);
+
+                    fetchAndPersistIDs(userId, "friends", GET_FRIENDS, this::createGetFriendsCallback);
+
                     LOG.info("Collected accounts followed by #{}", userId);
                 }
 
@@ -376,76 +394,61 @@ public final class TwitterUserResourcesRetrieverApp {
     }
 
 
-//    @SuppressWarnings("unchecked")
-//    private void fetchAndPersistFollowers(final Long userId) throws InterruptedException {
-//        final String followersFile = outFile(userId + "-followers.txt");
-//        try (BufferedWriter out = Files.newBufferedWriter(
-//            Paths.get(followersFile),
-//            StandardOpenOption.CREATE,
-//            StandardOpenOption.WRITE,
-//            StandardOpenOption.TRUNCATE_EXISTING
-//        )) {
-//            long cursor = -1, prevCursor = -1;
-//            List<Long> followers = Collections.emptyList();
-//            do {
-//                final ApiCall<Long, ApiCallResponse> callback = this.createGetFollowersCallback(cursor);
-//                IDsApiCallResponse resp = (IDsApiCallResponse) this.makeApiCall(userId, GET_FOLLOWERS, callback);
-//                prevCursor = cursor;
-//                cursor = resp.nextCursor;
-//                followers = (List<Long>) resp.payload;
-//
-//                LOG.info("Collected {} followers, starting at cursor {}", followers.size(), prevCursor);
-//
-//                for (Long id : followers) {
-//                    out.append(id.toString() + "\n").flush();
-//                }
-//            } while (! followers.isEmpty());
-//
-//        } catch (IOException e) {
-//            LOG.warn("Failed to write to {}", followersFile, e);
-//        }
-//    }
+    /**
+     * Fetches at least {@code fetchLimit} {@code tweetType} statuses (tweets)
+     * connected with {@link userId} using a callback created by the given
+     * {@code callbackGenerator} and the given {@code endpoint}.
+     *
+     * @param userId The ID of the Twitter user of interest.
+     * @param tweetType The type of tweet to collect (e.g. "tweets", "favourites").
+     * @param endpoint The Twitter RESTful endpoint that will be used.
+     * @param fetchLimit The minimum number of statuses to fetch, if possible (there may not be that many).
+     * @param callbackGenerator A function to generate an API-call specific callback to fetch the statuses.
+     * @throws InterruptedException If something fails while sleeping to adhere to Twitter's rate limits.
+     */
+    @SuppressWarnings("unchecked")
+    private void fetchAndPersistTweets(
+        final Long userId,
+        final String tweetType,
+        final String endpoint,
+        final int fetchLimit,
+        final Function<Integer, ApiCall<Long, ApiCallResponse>> callbackGenerator
+    ) throws InterruptedException {
 
+        final String tweetsFile = outFile(userId + "-" + tweetType + ".json");
+        try (BufferedWriter out = createFreshWriter(tweetsFile, true)) {
+            List<JsonNode> tweetNodes = Collections.emptyList();
+            int cumulativeTweetsFetched = 0;
+            int pageNo = 1;
+            do {
+                final ApiCall<Long, ApiCallResponse> callback = callbackGenerator.apply(pageNo++);
+                tweetNodes = (List<JsonNode>) this.makeApiCall(userId, endpoint, callback).payload;
+                cumulativeTweetsFetched += tweetNodes.size();
+                LOG.info("Retrieved another {} " + tweetType + " => total {}", tweetNodes.size(), cumulativeTweetsFetched);
 
-//    @SuppressWarnings("unchecked")
-//    private void fetchAndPersistFriends(final Long userId) throws InterruptedException {
-//        final String friendsFile = outFile(userId + "-friends.txt");
-//        try (BufferedWriter out = Files.newBufferedWriter(
-//            Paths.get(friendsFile),
-//            StandardOpenOption.CREATE,
-//            StandardOpenOption.WRITE,
-//            StandardOpenOption.TRUNCATE_EXISTING
-//        )) {
-//            long cursor = -1, prevCursor = -1;
-//            List<Long> friends = Collections.emptyList();
-//            do {
-//                final ApiCall<Long, ApiCallResponse> callback = this.createGetFriendsCallback(cursor);
-//                IDsApiCallResponse resp = (IDsApiCallResponse) this.makeApiCall(userId, GET_FRIENDS, callback);
-//                prevCursor = cursor;
-//                cursor = resp.nextCursor;
-//                friends = (List<Long>) resp.payload;
-//
-//                LOG.info("Collected {} friends, starting at cursor {}", friends.size(), prevCursor);
-//
-//                for (Long id : friends) {
-//                    out.append(id.toString() + "\n").flush();
-//                }
-//            } while (! friends.isEmpty());
-//
-//        } catch (IOException e) {
-//            LOG.warn("Failed to write to {}", friendsFile, e);
-//        }
-//    }
+                for (JsonNode tweetNode : tweetNodes) {
+                    out.append(tweetNode.toString()).append('\n').flush();
+                }
+                LOG.info("Wrote another {} " + tweetType + " to {}", tweetNodes.size(), tweetsFile);
+            } while (! tweetNodes.isEmpty() && cumulativeTweetsFetched < fetchLimit);
 
-    private void fetchAndPersistFollowers(final Long userId) throws InterruptedException {
-        fetchAndPersistIDs(userId, "followers", GET_FOLLOWERS, this::createGetFollowersCallback);
-    }
-
-    private void fetchAndPersistFriends(final Long userId) throws InterruptedException {
-        fetchAndPersistIDs(userId, "friends", GET_FRIENDS, this::createGetFriendsCallback);
+        } catch (IOException e) {
+            LOG.warn("Failed to write to {}", tweetsFile, e);
+        }
     }
 
 
+    /**
+     * Fetches all {@code idType} (e.g. "friends", "followers") IDs
+     * connected with {@link userId} using a callback created by the
+     * given {@code callbackGenerator} and the given {@code endpoint}.
+     *
+     * @param userId The ID of the Twitter user of interest.
+     * @param idType The type of IDs to collect (e.g. "friends", "followers").
+     * @param endpoint The Twitter RESTful endpoint that will be used.
+     * @param callbackGenerator A function to generate an API-call specific callback to fetch the statuses.
+     * @throws InterruptedException If something fails while sleeping to adhere to Twitter's rate limits.
+     */
     @SuppressWarnings("unchecked")
     private void fetchAndPersistIDs(
         final Long userId,
@@ -454,12 +457,7 @@ public final class TwitterUserResourcesRetrieverApp {
         final Function<Long, ApiCall<Long, ApiCallResponse>> callbackGenerator
     ) throws InterruptedException {
         final String idsFile = outFile(userId + "-" + idType + ".txt");
-        try (BufferedWriter out = Files.newBufferedWriter(
-            Paths.get(idsFile),
-            StandardOpenOption.CREATE,
-            StandardOpenOption.WRITE,
-            StandardOpenOption.TRUNCATE_EXISTING
-        )) {
+        try (BufferedWriter out = createFreshWriter(idsFile, true)) {
             long cursor = -1, prevCursor = -1;
             List<Long> ids = Collections.emptyList();
             do {
@@ -478,6 +476,34 @@ public final class TwitterUserResourcesRetrieverApp {
 
         } catch (IOException e) {
             LOG.warn("Failed to write to {}", idsFile, e);
+        }
+    }
+
+
+    /**
+     * Creates a new {@link BufferedWriter} to a file, creating it if it's not there,
+     * making it writable (<em>NB</em> truncating it before writing to it if
+     * {@code truncateFirst} is true).
+     *
+     * @param filename The path of the file to which to write.
+     * @param truncateFirst Truncate the file if it exists, before writing to it.
+     * @return A {@link BufferedWriter} for writing to the given file.
+     * @throws IOException If an error occurs attempting to establish the writer.
+     */
+    private BufferedWriter createFreshWriter(final String filename, boolean truncateFirst) throws IOException {
+        if (truncateFirst) {
+            return Files.newBufferedWriter(
+                Paths.get(filename),
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING
+            );
+        } else {
+            return Files.newBufferedWriter(
+                Paths.get(filename),
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE
+            );
         }
     }
 
@@ -513,19 +539,17 @@ public final class TwitterUserResourcesRetrieverApp {
             try {
                 LOG.info("Collecting tweets posted by #{} with {}", id, GET_TWEETS);
                 final ResponseList<Status> userTimeline =
-                    this.twitter.getUserTimeline(id.longValue(), new Paging(pageNo, 200));
-                // extract raw json and write it to file
+                    this.twitter.getUserTimeline(id.longValue(), new Paging(pageNo, TWEET_BATCH_SIZE));
+                // extract raw json and create a payload from it
                 final String rawJsonTweets = TwitterObjectFactory.getRawJSON(userTimeline);
-                final StringBuilder tweetsToSave = new StringBuilder();
                 for (JsonNode tweetNode : this.json.readTree(rawJsonTweets)) {
                     tweetsRetrieved.add(tweetNode);
-                    tweetsToSave.append(tweetNode.toString()).append('\n');
                 }
-                String tweetsFile = this.outFile(id.toString() + "-tweets.json");
-                saveText(tweetsToSave.toString(), tweetsFile);
-                LOG.info("Wrote {} tweets to {}", tweetsRetrieved.size(), tweetsFile);
                 return apiCallSuccess(userTimeline.getRateLimitStatus(), tweetsRetrieved);
-            } catch (IOException | TwitterException e) {
+            } catch (TwitterException e) {
+                LOG.warn("Barfed calling Twitter for tweets for {}.", id, e);
+                return apiCallError(e.getRateLimitStatus(), tweetsRetrieved, e);
+            } catch (IOException e) {
                 LOG.warn("Barfed parsing JSON or saving to file tweets for {}.", id, e);
                 return apiCallError(e, tweetsRetrieved);
             }
@@ -546,20 +570,18 @@ public final class TwitterUserResourcesRetrieverApp {
             try {
                 LOG.info("Collecting tweets favourited by #{} with {}", id, GET_FAVES);
                 final ResponseList<Status> favesTimeline =
-                    this.twitter.getFavorites(id.longValue(), new Paging(pageNo, 200));
-                // extract raw json and write it to file
+                    this.twitter.getFavorites(id.longValue(), new Paging(pageNo, TWEET_BATCH_SIZE));
+                // extract raw json and collect it for the response
                 final String rawJsonTweets = TwitterObjectFactory.getRawJSON(favesTimeline);
-                final StringBuilder favesToSave = new StringBuilder();
                 for (JsonNode tweetNode : this.json.readTree(rawJsonTweets)) {
                     favesRetrieved.add(tweetNode);
-                    favesToSave.append(tweetNode.toString()).append('\n');
                 }
-                String favesFile = this.outFile(id.toString() + "-favourites.json");
-                saveText(favesToSave.toString(), favesFile);
-                LOG.info("Wrote {} favourites to {}", favesRetrieved.size(), favesFile);
                 return apiCallSuccess(favesTimeline.getRateLimitStatus(), favesRetrieved);
-            } catch (IOException | TwitterException e) {
-                LOG.warn("Barfed parsing JSON or saving to file favourites for {}.", id, e);
+            } catch (TwitterException e) {
+                LOG.warn("Barfed calling Twitter for tweets for {}.", id, e);
+                return apiCallError(e.getRateLimitStatus(), favesRetrieved, e);
+            } catch (IOException e) {
+                LOG.warn("Barfed parsing JSON or saving to file tweets for {}.", id, e);
                 return apiCallError(e, favesRetrieved);
             }
         };
@@ -591,7 +613,7 @@ public final class TwitterUserResourcesRetrieverApp {
                 );
             } catch (TwitterException e) {
                 LOG.warn("Barfed parsing JSON or saving to file followers for {}.", id, e);
-                return new IDsApiCallResponse(null, batchOfIDs, cursor, cursor, e);
+                return new IDsApiCallResponse(e.getRateLimitStatus(), batchOfIDs, cursor, cursor, e);
             }
         };
     }
@@ -622,7 +644,7 @@ public final class TwitterUserResourcesRetrieverApp {
                 );
             } catch (TwitterException e) {
                 LOG.warn("Barfed parsing JSON or saving to file friends of {}.", id, e);
-                return new IDsApiCallResponse(null, batchOfIDs, cursor, cursor, e);
+                return new IDsApiCallResponse(e.getRateLimitStatus(), batchOfIDs, cursor, cursor, e);
             }
         };
     }
@@ -674,7 +696,7 @@ public final class TwitterUserResourcesRetrieverApp {
 
             ApiCallResponse resp = callback.apply(twitterId);
 
-            if (resp.succeeded()) {
+            if (resp.hasARateLimitStatusUpdate()) {
                 RateLimitStatus rls = resp.rls;
                 limitData.remaining = rls.getRemaining();
                 this.debug("Endpoint {} has {} calls remaining.", endpoint, limitData.remaining);
@@ -745,21 +767,21 @@ public final class TwitterUserResourcesRetrieverApp {
         return new LimitData(rls.getLimit(), rls.getRemaining(), rls.getResetTimeInSeconds());
     }
 
-    /**
-     * Writes the given {@code text} {@link String} to the specified file.
-     *
-     * @param text the String to persist (may be JSON)
-     * @param fileName the file (including path) to which to write the text
-     * @throws IOException if there's a problem writing to the specified file
-     */
-    private static void saveText(final String text, final String fileName) throws IOException {
-        try (final FileOutputStream fos = new FileOutputStream(fileName);
-             final OutputStreamWriter osw = new OutputStreamWriter(fos, "UTF-8");
-             final BufferedWriter bw = new BufferedWriter(osw)) {
-            bw.write(text);
-            bw.flush();
-        }
-    }
+//    /**
+//     * Writes the given {@code text} {@link String} to the specified file.
+//     *
+//     * @param text the String to persist (may be JSON)
+//     * @param fileName the file (including path) to which to write the text
+//     * @throws IOException if there's a problem writing to the specified file
+//     */
+//    private static void saveText(final String text, final String fileName) throws IOException {
+//        try (final FileOutputStream fos = new FileOutputStream(fileName);
+//             final OutputStreamWriter osw = new OutputStreamWriter(fos, "UTF-8");
+//             final BufferedWriter bw = new BufferedWriter(osw)) {
+//            bw.write(text);
+//            bw.flush();
+//        }
+//    }
 
 
     /**
@@ -798,8 +820,10 @@ public final class TwitterUserResourcesRetrieverApp {
      * @throws IOException if there's an error loading the application's
      *         {@link #credentialsFile}.
      */
-    private static Configuration twitterConfig
-        (final String credentialsFile, final boolean debug) throws IOException {
+    private static Configuration twitterConfig(
+        final String credentialsFile, final boolean debug
+    ) throws IOException {
+
         final Properties credentials = loadCredentials(credentialsFile);
 
         final ConfigurationBuilder conf = new ConfigurationBuilder();
