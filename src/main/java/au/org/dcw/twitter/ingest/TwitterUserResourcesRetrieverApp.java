@@ -52,6 +52,7 @@ import com.google.common.base.Stopwatch;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 
+import twitter4j.HttpResponseCode;
 import twitter4j.IDs;
 import twitter4j.Paging;
 import twitter4j.RateLimitStatus;
@@ -106,6 +107,7 @@ public final class TwitterUserResourcesRetrieverApp {
         private static final Options OPTIONS = new Options();
         static {
             OPTIONS.addOption("i", "identifiers-file", true, "File of Twitter screen names");
+            OPTIONS.addOption(longOpt("ids", "Inline, comma-delimited listing of Twitter IDs to look up (alternative to --identifiers-file)").hasArg().create());
             OPTIONS.addOption(longOpt("tweets", "Collect statuses (tweets)").create());
             OPTIONS.addOption(longOpt("target-tweet-count", "Collect at least this many statuses (tweets) (default: 200)").hasArg().create());
             OPTIONS.addOption(longOpt("favourites", "Collect favourited statuses").create());
@@ -138,6 +140,7 @@ public final class TwitterUserResourcesRetrieverApp {
         private String outputDir = "./output";
         private String credentialsFile = "./twitter.properties";
         private boolean debug = false;
+        private String[] ids;
 
         static Config parse(String[] args) {
             final CommandLineParser parser = new BasicParser();
@@ -145,6 +148,7 @@ public final class TwitterUserResourcesRetrieverApp {
             try {
                 final CommandLine cmd = parser.parse(OPTIONS, args);
                 if (cmd.hasOption('i')) cfg.idsFile = cmd.getOptionValue('i');
+                if (cmd.hasOption("ids")) cfg.ids = cmd.getOptionValue("ids").split(",");
                 if (cmd.hasOption("tweets")) cfg.fetchTweets = true;
                 if (cmd.hasOption("target-tweet-count")) { // 200 by default
                     cfg.numTweetsToFetch = Integer.parseInt(cmd.getOptionValue("target-tweet-count"));
@@ -166,7 +170,7 @@ public final class TwitterUserResourcesRetrieverApp {
         }
 
         public void check() {
-            if (this.idsFile == null) {
+            if (this.idsFile == null && (this.ids == null || this.ids.length == 0)) {
                 printUsageAndExit();
             }
         }
@@ -331,7 +335,7 @@ public final class TwitterUserResourcesRetrieverApp {
         LOG.info("* followers:  " + this.cfg.fetchFollowers);
         LOG.info("* friends:    " + this.cfg.fetchFriends);
 
-        final List<Long> ids = this.loadIDs(this.cfg.idsFile);
+        final List<Long> ids = this.loadIDs(this.cfg);
 
         LOG.info("Read {} Twitter IDs", ids.size());
 
@@ -547,7 +551,7 @@ public final class TwitterUserResourcesRetrieverApp {
                 }
                 return apiCallSuccess(userTimeline.getRateLimitStatus(), tweetsRetrieved);
             } catch (TwitterException e) {
-                LOG.warn("Barfed calling Twitter for tweets for {}.", id, e);
+                logTwitterApiException(id, e);
                 return apiCallError(e.getRateLimitStatus(), tweetsRetrieved, e);
             } catch (IOException e) {
                 LOG.warn("Barfed parsing JSON or saving to file tweets for {}.", id, e);
@@ -578,7 +582,7 @@ public final class TwitterUserResourcesRetrieverApp {
                 }
                 return apiCallSuccess(favesTimeline.getRateLimitStatus(), favesRetrieved);
             } catch (TwitterException e) {
-                LOG.warn("Barfed calling Twitter for tweets for {}.", id, e);
+                logTwitterApiException(id, e);
                 return apiCallError(e.getRateLimitStatus(), favesRetrieved, e);
             } catch (IOException e) {
                 LOG.warn("Barfed parsing JSON or saving to file tweets for {}.", id, e);
@@ -612,7 +616,7 @@ public final class TwitterUserResourcesRetrieverApp {
                     null
                 );
             } catch (TwitterException e) {
-                LOG.warn("Barfed parsing JSON or saving to file followers for {}.", id, e);
+                logTwitterApiException(id, e);
                 return new IDsApiCallResponse(e.getRateLimitStatus(), batchOfIDs, cursor, cursor, e);
             }
         };
@@ -643,10 +647,28 @@ public final class TwitterUserResourcesRetrieverApp {
                     null
                 );
             } catch (TwitterException e) {
-                LOG.warn("Barfed parsing JSON or saving to file friends of {}.", id, e);
+                logTwitterApiException(id, e);
                 return new IDsApiCallResponse(e.getRateLimitStatus(), batchOfIDs, cursor, cursor, e);
             }
         };
+    }
+
+
+    /**
+     * Log a warning regarding the {@link TwitterException} {@code e} occurring
+     * when talking with Twitter about Twitter user {@code id}. Where possible,
+     * this customises the error message to match the nature of the error, rather
+     * than simply spamming the logs with exception stacktraces.
+     *
+     * @param id The ID of the Twitter user used in the Twitter API call that generated <code>e</code>.
+     * @param e The {@link TwitterException} that occurred when talking to the Twitter API.
+     */
+    private void logTwitterApiException(Long id, TwitterException e) {
+        if (e.getStatusCode() == HttpResponseCode.UNAUTHORIZED) {
+            LOG.warn("Account {} is protected and innaccessible", id);
+        } else {
+            LOG.warn("Barfed parsing JSON or saving to file info related to {}.", id, e);
+        }
     }
 
 
@@ -767,26 +789,11 @@ public final class TwitterUserResourcesRetrieverApp {
         return new LimitData(rls.getLimit(), rls.getRemaining(), rls.getResetTimeInSeconds());
     }
 
-//    /**
-//     * Writes the given {@code text} {@link String} to the specified file.
-//     *
-//     * @param text the String to persist (may be JSON)
-//     * @param fileName the file (including path) to which to write the text
-//     * @throws IOException if there's a problem writing to the specified file
-//     */
-//    private static void saveText(final String text, final String fileName) throws IOException {
-//        try (final FileOutputStream fos = new FileOutputStream(fileName);
-//             final OutputStreamWriter osw = new OutputStreamWriter(fos, "UTF-8");
-//             final BufferedWriter bw = new BufferedWriter(osw)) {
-//            bw.write(text);
-//            bw.flush();
-//        }
-//    }
-
 
     /**
-     * Reads Twitter IDs (expected to be longs) from the given
-     * <code>idsFile</code> into a list. IDs are listed in the file
+     * Reads Twitter IDs (expected to be longs) from the given array of
+     * ID strings ({@link Config#ids}) if provided, otherwise it reads them
+     * from {@link Config#idsFile} into a list. IDs are expected in the file
      * as one ID per line. Lines starting with '#' will be ignored.
      * Content on a line following a '#' will be ignored. Example file:
      * <pre>
@@ -797,16 +804,22 @@ public final class TwitterUserResourcesRetrieverApp {
      * 101 # @frodo
      * </pre>
      *
-     * @param idsFile Path to a file with Twitter IDs (long values)
+     * @param config Config object with an <code>ids</code> array or an <code>idsFile</code>
+     *          file path to a file with Twitter IDs (long values).
      * @return A list of Twitter IDs.
-     * @throws IOException If there's an issue reading the file or parsing the IDs.
+     * @throws IOException If there's an issue reading the file.
+     * @throws NumberFormatException If there's an issue parsing the IDs.
      */
-    private List<Long> loadIDs(final String idsFile) throws IOException {
-        return Files.readAllLines(Paths.get(idsFile)).stream()
-            .map(l -> l.split("#")[0].trim())
-            .filter(l -> l.length() > 0 && ! l.startsWith("#"))
-            .map(Long::parseLong)
-            .collect(Collectors.toList());
+    private List<Long> loadIDs(final Config config) throws IOException {
+        if (config.ids != null && config.ids.length > 0) {
+            return Arrays.stream(config.ids).map(Long::parseLong).collect(Collectors.toList());
+        } else {
+            return Files.readAllLines(Paths.get(config.idsFile)).stream()
+                .map(l -> l.split("#")[0].trim())
+                .filter(l -> l.length() > 0 && ! l.startsWith("#"))
+                .map(Long::parseLong)
+                .collect(Collectors.toList());
+        }
     }
 
     /**
