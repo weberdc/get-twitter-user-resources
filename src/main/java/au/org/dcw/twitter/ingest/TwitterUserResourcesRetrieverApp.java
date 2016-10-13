@@ -31,6 +31,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
@@ -335,7 +336,7 @@ public final class TwitterUserResourcesRetrieverApp {
         LOG.info("* followers:  " + this.cfg.fetchFollowers);
         LOG.info("* friends:    " + this.cfg.fetchFriends);
 
-        final List<Long> ids = this.loadIDs(this.cfg);
+        final Set<Long> ids = this.loadIDs(this.cfg);
 
         LOG.info("Read {} Twitter IDs", ids.size());
 
@@ -383,7 +384,7 @@ public final class TwitterUserResourcesRetrieverApp {
                 }
                 // Retrieve friends
                 if (this.cfg.fetchFriends) {
-                    LOG.info("Collecting accounts followed by #{} with {} - NYI", userId, GET_FRIENDS);
+                    LOG.info("Collecting accounts followed by #{} with {}", userId, GET_FRIENDS);
 
                     fetchAndPersistIDs(userId, "friends", GET_FRIENDS, this::createGetFriendsCallback);
 
@@ -810,15 +811,15 @@ public final class TwitterUserResourcesRetrieverApp {
      * @throws IOException If there's an issue reading the file.
      * @throws NumberFormatException If there's an issue parsing the IDs.
      */
-    private List<Long> loadIDs(final Config config) throws IOException {
+    private Set<Long> loadIDs(final Config config) throws IOException {
         if (config.ids != null && config.ids.length > 0) {
-            return Arrays.stream(config.ids).map(Long::parseLong).collect(Collectors.toList());
+            return Arrays.stream(config.ids).map(Long::parseLong).collect(Collectors.toSet());
         } else {
             return Files.readAllLines(Paths.get(config.idsFile)).stream()
                 .map(l -> l.split("#")[0].trim())
                 .filter(l -> l.length() > 0 && ! l.startsWith("#"))
                 .map(Long::parseLong)
-                .collect(Collectors.toList());
+                .collect(Collectors.toSet());
         }
     }
 
