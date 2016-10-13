@@ -16,10 +16,10 @@
 package au.org.dcw.twitter.ingest;
 
 import java.io.BufferedWriter;
-import java.io.File;
 import java.io.IOException;
 import java.io.Reader;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
@@ -80,6 +80,8 @@ import twitter4j.conf.ConfigurationBuilder;
  */
 @SuppressWarnings("static-access")
 public final class TwitterUserResourcesRetrieverApp {
+    private static final long DEFAULT_MAX_ID = Long.MAX_VALUE;
+
     /**
      * This fudge amount (milliseconds) is added to the time a thread goes to
      * sleep when it needs to wait until the next rate limiting window. This is
@@ -89,17 +91,27 @@ public final class TwitterUserResourcesRetrieverApp {
      */
     private static final int SLEEP_DURATION_FUDGE_AMOUNT = 10000;
 
+    /** Batches will miss deleted tweets and IDs, so account for that when looking at batch sizes. */
+    private static final int BATCH_FUDGE = 10;
+
     /**
      * The maximum number of statuses (tweets) to request when asking for timeline
      * tweets or favourites from Twitter (as specified by Twitter's API docs).
      */
-    private static final int TWEET_BATCH_SIZE = 200;
+    private static final int TWEET_BATCH_SIZE = 200 - BATCH_FUDGE;
+
+    /**
+     * The maximum number of IDs to request when asking for friend or follower
+     * IDs from Twitter (as specified by Twitter's API docs).
+     */
+    private static final int ID_BATCH_SIZE = 200 - BATCH_FUDGE;
 
     private static final String GET_TWEETS = "/statuses/home_timeline";
     private static final String GET_FAVES = "/favorites/list";
     private static final String GET_FOLLOWERS = "/followers/ids";
     private static final String GET_FRIENDS = "/friends/ids";
 
+    private static final String DEFAULT_CREDENTIALS_PATH = "./twitter.properties";
     private static final String FILE_SEPARATOR = System.getProperty("file.separator", "/");
     private static final Logger LOG = LoggerFactory.getLogger(TwitterUserResourcesRetrieverApp.class);
 
@@ -349,6 +361,7 @@ public final class TwitterUserResourcesRetrieverApp {
 
         this.twitter = this.establishTwitterConnection();
 
+        int runningTotal = 0;
         for (final Long userId : ids) {
 
             try {
@@ -391,6 +404,8 @@ public final class TwitterUserResourcesRetrieverApp {
                     LOG.info("Collected accounts followed by #{}", userId);
                 }
 
+                LOG.info("Collected resources for {} of {} accounts so far...", ++runningTotal, ids.size());
+
             } catch (InterruptedException e) {
                 LOG.warn("Failed to communicate with Twitter somehow", e);
             }
@@ -417,25 +432,32 @@ public final class TwitterUserResourcesRetrieverApp {
         final String tweetType,
         final String endpoint,
         final int fetchLimit,
-        final Function<Integer, ApiCall<Long, ApiCallResponse>> callbackGenerator
+        final Function<Long, ApiCall<Long, ApiCallResponse>> callbackGenerator
     ) throws InterruptedException {
 
         final String tweetsFile = outFile(userId + "-" + tweetType + ".json");
         try (BufferedWriter out = createFreshWriter(tweetsFile, true)) {
             List<JsonNode> tweetNodes = Collections.emptyList();
             int cumulativeTweetsFetched = 0;
-            int pageNo = 1;
+            long maxId = DEFAULT_MAX_ID; // i.e. get tweets younger than this value
+            boolean bail = false;
             do {
-                final ApiCall<Long, ApiCallResponse> callback = callbackGenerator.apply(pageNo++);
+                final ApiCall<Long, ApiCallResponse> callback = callbackGenerator.apply(maxId);
                 tweetNodes = (List<JsonNode>) this.makeApiCall(userId, endpoint, callback).payload;
                 cumulativeTweetsFetched += tweetNodes.size();
                 LOG.info("Retrieved another {} " + tweetType + " => total {}", tweetNodes.size(), cumulativeTweetsFetched);
 
+                long minId = DEFAULT_MAX_ID;
                 for (JsonNode tweetNode : tweetNodes) {
+                    long tweetId = tweetNode.get("id").asLong();
+                    minId = Math.min(minId, tweetId - 1);
                     out.append(tweetNode.toString()).append('\n').flush();
                 }
+                maxId = minId;
                 LOG.info("Wrote another {} " + tweetType + " to {}", tweetNodes.size(), tweetsFile);
-            } while (! tweetNodes.isEmpty() && cumulativeTweetsFetched < fetchLimit);
+
+                bail = (tweetNodes.size() < TWEET_BATCH_SIZE); // not enough to fill a batch
+            } while (! bail && ! tweetNodes.isEmpty() && cumulativeTweetsFetched < fetchLimit);
 
         } catch (IOException e) {
             LOG.warn("Failed to write to {}", tweetsFile, e);
@@ -465,6 +487,7 @@ public final class TwitterUserResourcesRetrieverApp {
         try (BufferedWriter out = createFreshWriter(idsFile, true)) {
             long cursor = -1, prevCursor = -1;
             List<Long> ids = Collections.emptyList();
+            boolean bail = false;
             do {
                 final ApiCall<Long, ApiCallResponse> callback = callbackGenerator.apply(cursor);
                 IDsApiCallResponse resp = (IDsApiCallResponse) this.makeApiCall(userId, endpoint, callback);
@@ -477,7 +500,10 @@ public final class TwitterUserResourcesRetrieverApp {
                 for (Long id : ids) {
                     out.append(id.toString() + "\n").flush();
                 }
-            } while (! ids.isEmpty());
+
+                bail = (ids.size() < ID_BATCH_SIZE); // not enough to fill a batch
+
+            } while (! bail && ! ids.isEmpty());
 
         } catch (IOException e) {
             LOG.warn("Failed to write to {}", idsFile, e);
@@ -532,19 +558,19 @@ public final class TwitterUserResourcesRetrieverApp {
 
 
     /**
-     * Creates a callback to a Twitter API call to fetch the specified page
-     * (starting at 1) of tweets for a given ID, in batches of 200.
+     * Creates a callback to a Twitter API call to fetch the tweets younger
+     * (posted earlier) than {@code maxId} for a given Twitter ID (the argument
+     * to the callback), in batches of {@link #TWEET_BATCH_SIZE}.
      *
-     * @param pageNo The page of results to request (starting at 1).
+     * @param maxId Get tweets with IDs younger (less) than this ID.
      * @return An {@link ApiCallResponse} instance.
      */
-    private ApiCall<Long, ApiCallResponse> createGetTweetsCallback(final int pageNo) {
+    private ApiCall<Long, ApiCallResponse> createGetTweetsCallback(final long maxId) {
         return (Long id) -> {
             List<Object> tweetsRetrieved = Lists.newArrayList();
             try {
                 LOG.info("Collecting tweets posted by #{} with {}", id, GET_TWEETS);
-                final ResponseList<Status> userTimeline =
-                    this.twitter.getUserTimeline(id.longValue(), new Paging(pageNo, TWEET_BATCH_SIZE));
+                final ResponseList<Status> userTimeline = this.twitter.getUserTimeline(id.longValue(), tweetsBefore(maxId));
                 // extract raw json and create a payload from it
                 final String rawJsonTweets = TwitterObjectFactory.getRawJSON(userTimeline);
                 for (JsonNode tweetNode : this.json.readTree(rawJsonTweets)) {
@@ -563,19 +589,39 @@ public final class TwitterUserResourcesRetrieverApp {
 
 
     /**
-     * Creates a callback to a Twitter API call to fetch the specified page
-     * (starting at 1) of favourite tweets for a given ID, in batches of 200.
+     * Create a {@link Paging} instance for collecting batches of tweets older than
+     * {@code maxId}. if {@code maxId} is {@link #DEFAULT_MAX_ID}, then a {@link Paging}
+     * instance for the first page of results is returned.
      *
-     * @param pageNo The page of results to request (starting at 1).
+     * @param maxId The maximum ID of tweets being requested (i.e. get tweets older than this).
+     * @return A suitably configured {@link Paging} instance.
+     */
+    private Paging tweetsBefore(final long maxId) {
+        if (maxId == DEFAULT_MAX_ID) {
+            return new Paging(1, TWEET_BATCH_SIZE);
+        } else {
+            Paging pagingInfo = new Paging();
+            pagingInfo.setCount(TWEET_BATCH_SIZE);
+            pagingInfo.setMaxId(maxId);
+            return pagingInfo;
+        }
+    }
+
+
+    /**
+     * Creates a callback to a Twitter API call to fetch the favourited tweets younger
+     * (posted earlier) than {@code maxId} for a given Twitter ID (the argument
+     * to the callback), in batches of {@link #TWEET_BATCH_SIZE}.
+     *
+     * @param maxId Get tweets with IDs younger (less) than this ID.
      * @return An {@link ApiCallResponse} instance.
      */
-    private ApiCall<Long, ApiCallResponse> createGetFavesCallback(final int pageNo) {
+    private ApiCall<Long, ApiCallResponse> createGetFavesCallback(final long maxId) {
         return (Long id) -> {
             List<Object> favesRetrieved = Lists.newArrayList();
             try {
                 LOG.info("Collecting tweets favourited by #{} with {}", id, GET_FAVES);
-                final ResponseList<Status> favesTimeline =
-                    this.twitter.getFavorites(id.longValue(), new Paging(pageNo, TWEET_BATCH_SIZE));
+                final ResponseList<Status> favesTimeline = this.twitter.getFavorites(id.longValue(), tweetsBefore(maxId));
                 // extract raw json and collect it for the response
                 final String rawJsonTweets = TwitterObjectFactory.getRawJSON(favesTimeline);
                 for (JsonNode tweetNode : this.json.readTree(rawJsonTweets)) {
@@ -867,26 +913,63 @@ public final class TwitterUserResourcesRetrieverApp {
      */
     private static Properties loadCredentials(final String credentialsFile) throws IOException {
         final Properties properties = new Properties();
-        properties.load(Files.newBufferedReader(Paths.get(credentialsFile)));
+
+        Path credsPath = Paths.get(credentialsFile);
+        if (credentialsFile.equals(DEFAULT_CREDENTIALS_PATH)) {
+            credsPath = checkPath(credsPath);
+        }
+
+        properties.load(Files.newBufferedReader(credsPath));
+
         return properties;
     }
 
+
     /**
-     * Loads proxy properties from {@code ./proxy.properties} and, if a password
-     * is not supplied, asks for it in the console. The properties collected are
-     * also shunted into the System properties object.
+     * Examines the path (assumed to be to a file in the current directory) and checks
+     * if it exists, and resorts to looking in the user's home directory for a corresponding
+     * file if it does not. Returns the original, or the updated, path if a file is found
+     * and throws a {@link RuntimeException} if not.
+     *
+     * @param file The path to the local file to check.
+     * @return A valid path to an existing file.
+     * @throws RuntimeException if the file does not exist in the local or home directories.
+     */
+    private static Path checkPath(final Path file) {
+        if (! file.toFile().exists()) {
+            final String homePath = System.getProperty("user.home", ".") + FILE_SEPARATOR;
+            final String altPath = homePath + file.getFileName();
+
+            LOG.warn("No file at {}. Trying {}.", file, altPath);
+
+            final Path newPath = Paths.get(altPath);
+            if (! newPath.toFile().exists()) {
+                throw new RuntimeException(
+                    "Cannot find file at " + file + " nor alternative " + altPath
+                );
+            }
+            LOG.info("Found file at {}", newPath);
+            return newPath;
+        }
+        return file;
+    }
+
+
+    /**
+     * Loads proxy properties from {@code ./proxy.properties} or {@link ~/proxy.properties}
+     * and, if a password is not supplied, asks for it in the console.
      *
      * @return A Properties instance filled with proxy information.
      */
     private static Properties loadProxyProperties() {
         final Properties properties = new Properties();
-        final String proxyFile = "./proxy.properties";
-        if (new File(proxyFile).exists()) {
+        Path proxyPath = checkPath(Paths.get("./proxy.properties"));
+        if (proxyPath.toFile().exists()) {
             boolean success = true;
-            try (Reader fileReader = Files.newBufferedReader(Paths.get(proxyFile))) {
+            try (Reader fileReader = Files.newBufferedReader(proxyPath)) {
                 properties.load(fileReader);
             } catch (final IOException e) {
-                System.err.printf("Attempted and failed to load %s: %s\n", proxyFile, e.getMessage());
+                System.err.printf("Attempted and failed to load %s: %s\n", proxyPath, e.getMessage());
                 success = false;
             }
             if (success && !properties.containsKey("http.proxyPassword")) {
