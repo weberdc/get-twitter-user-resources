@@ -410,7 +410,7 @@ public final class TwitterUserResourcesRetrieverApp {
                 profiles.forEach(p -> profileMap.put(p.getId(), p));
 
                 for (JsonNode profileNode : json.readTree(rawJSON)) {
-                    final String profileFile = profileNode.get("id_str").asText() + "-profile.json";
+                    final String profileFile = outFile(profileNode.get("id_str").asText() + "-profile.json");
                     try (BufferedWriter out = createFreshWriter(profileFile, true)) {
                         out.append(profileNode.toString()).append('\n').flush();
                     } catch (IOException e) {
@@ -543,14 +543,14 @@ public final class TwitterUserResourcesRetrieverApp {
         final String tweetsFile = outFile(userId + "-" + tweetType + ".json");
         try (BufferedWriter out = createFreshWriter(tweetsFile, true)) {
             List<JsonNode> tweetNodes = Collections.emptyList();
-            int cumulativeTweetsFetched = 0;
+            int tweetsFetched = 0;
             long maxId = DEFAULT_MAX_ID; // i.e. get tweets younger than this value
             boolean bail = false;
             do {
                 final ApiCall<Long, ApiCallResponse> callback = callbackGenerator.apply(maxId);
                 tweetNodes = (List<JsonNode>) this.makeApiCall(userId, endpoint, callback).payload;
-                cumulativeTweetsFetched += tweetNodes.size();
-                LOG.info("Retrieved another {} " + tweetType + " => total {}", tweetNodes.size(), cumulativeTweetsFetched);
+                tweetsFetched += tweetNodes.size();
+                LOG.info("Retrieved {} of {} {}", tweetsFetched, fetchLimit, tweetType);
 
                 long minId = DEFAULT_MAX_ID;
                 for (JsonNode tweetNode : tweetNodes) {
@@ -562,7 +562,7 @@ public final class TwitterUserResourcesRetrieverApp {
                 LOG.info("Wrote another {} " + tweetType + " to {}", tweetNodes.size(), tweetsFile);
 
                 bail = (tweetNodes.size() < TWEET_BATCH_SIZE); // not enough to fill a batch
-            } while (! bail && ! tweetNodes.isEmpty() && cumulativeTweetsFetched < fetchLimit);
+            } while (! bail && ! tweetNodes.isEmpty() && tweetsFetched < fetchLimit);
 
         } catch (IOException e) {
             LOG.warn("Failed to write to {}", tweetsFile, e);
@@ -602,10 +602,10 @@ public final class TwitterUserResourcesRetrieverApp {
                 prevCursor = cursor;
                 cursor = resp.nextCursor;
                 ids = (List<Long>) resp.payload;
-
-                LOG.info("Collected {} {}, starting at cursor {}", ids.size(), idType, prevCursor);
-
                 idsFetched += ids.size();
+
+                LOG.info("Collected {} of {} {}, starting at cursor {}", idsFetched, fetchTarget, idType, prevCursor);
+
                 for (Long id : ids) {
                     out.append(id.toString() + "\n").flush();
                 }
