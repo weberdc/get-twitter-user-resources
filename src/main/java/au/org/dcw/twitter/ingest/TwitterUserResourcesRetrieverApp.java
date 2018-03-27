@@ -26,17 +26,14 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.Properties;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import com.google.common.collect.LinkedListMultimap;
+import com.google.common.collect.Multimap;
 import org.apache.commons.cli.BasicParser;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.CommandLineParser;
@@ -44,6 +41,14 @@ import org.apache.commons.cli.HelpFormatter;
 import org.apache.commons.cli.OptionBuilder;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
+import org.apache.http.HttpEntity;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.ClientProtocolException;
+import org.apache.http.client.ResponseHandler;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClients;
+import org.apache.http.util.EntityUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -53,16 +58,7 @@ import com.google.common.base.Stopwatch;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 
-import twitter4j.HttpResponseCode;
-import twitter4j.IDs;
-import twitter4j.Paging;
-import twitter4j.RateLimitStatus;
-import twitter4j.ResponseList;
-import twitter4j.Status;
-import twitter4j.Twitter;
-import twitter4j.TwitterException;
-import twitter4j.TwitterFactory;
-import twitter4j.TwitterObjectFactory;
+import twitter4j.*;
 import twitter4j.conf.Configuration;
 import twitter4j.conf.ConfigurationBuilder;
 
@@ -101,19 +97,30 @@ public final class TwitterUserResourcesRetrieverApp {
     private static final int TWEET_BATCH_SIZE = 200 - BATCH_FUDGE;
 
     /**
+     * The maximum number of profiles to request when asking Twitter's API.
+     */
+    private static final int PROFILE_BATCH_SIZE = 100;
+
+    /**
      * The maximum number of IDs to request when asking for friend or follower
      * IDs from Twitter (as specified by Twitter's API docs).
+     *
+     * @see <a href="https://developer.twitter.com/en/docs/accounts-and-users/follow-search-get-users/api-reference/get-followers-ids">GET /followers/ids - Twitter Developers</a>
      */
-    private static final int ID_BATCH_SIZE = 200 - BATCH_FUDGE;
+    private static final int ID_BATCH_SIZE = /*200*/ 5000 - BATCH_FUDGE;
 
     private static final String GET_TWEETS = "/statuses/home_timeline";
     private static final String GET_FAVES = "/favorites/list";
     private static final String GET_FOLLOWERS = "/followers/ids";
     private static final String GET_FRIENDS = "/friends/ids";
+    private static final String GET_MENTIONS = "/search/tweets";
 
     private static final String DEFAULT_CREDENTIALS_PATH = "./twitter.properties";
     private static final String FILE_SEPARATOR = System.getProperty("file.separator", "/");
     private static final Logger LOG = LoggerFactory.getLogger(TwitterUserResourcesRetrieverApp.class);
+    private static final int MENTION_BATCH_SIZE = 100;
+
+    private static Properties credentials;
 
     /** Class for managing command line options to this application. */
     static class Config {
@@ -126,7 +133,11 @@ public final class TwitterUserResourcesRetrieverApp {
             OPTIONS.addOption(longOpt("favourites", "Collect favourited statuses").create());
             OPTIONS.addOption(longOpt("target-favourite-count", "Collect at least this many favourited statuses (default: 200)").hasArg().create());
             OPTIONS.addOption(longOpt("followers", "Collect follower IDs").create());
+            OPTIONS.addOption(longOpt("target-followers-count", "Collect at least this many follower IDs (default: 4900)").hasArg().create());
             OPTIONS.addOption(longOpt("friends", "Collect friend (followee) IDs").create());
+            OPTIONS.addOption(longOpt("target-friends-count", "Collect at least this many friend (followee) IDs (default: 4900)").hasArg().create());
+            OPTIONS.addOption(longOpt("mentions", "Collect mentions of this account").create());
+            OPTIONS.addOption(longOpt("target-mention-count", "Collect at least this many mentions of this account (default: 100)").hasArg().create());
             OPTIONS.addOption("o", "output-directory", true, "Directory to which to write profiles (default: ./output)");
             OPTIONS.addOption("c", "credentials", true, "File of Twitter credentials (default: ./twitter.properties)");
             OPTIONS.addOption("d", "debug", false, "Turn on debugging information (default: false)");
@@ -148,8 +159,12 @@ public final class TwitterUserResourcesRetrieverApp {
         private int numTweetsToFetch = 200;
         private boolean fetchFaves = false;
         private int numFavouritesToFetch = 200;
+        private boolean fetchMentions = false;
+        private int numMentionsToFetch = MENTION_BATCH_SIZE;
         private boolean fetchFollowers = false;
+        private int numFollowersToFetch = 4900;
         private boolean fetchFriends = false;
+        private int numFriendsToFetch = 4900;
         private String outputDir = "./output";
         private String credentialsFile = "./twitter.properties";
         private boolean debug = false;
@@ -171,7 +186,17 @@ public final class TwitterUserResourcesRetrieverApp {
                     cfg.numFavouritesToFetch = Integer.parseInt(cmd.getOptionValue("target-favourite-count"));
                 }
                 if (cmd.hasOption("followers")) cfg.fetchFollowers = true;
+                if (cmd.hasOption("target-followers-count")) { // 100 by default
+                    cfg.numFollowersToFetch = Integer.parseInt(cmd.getOptionValue("target-followers-count"));
+                }
                 if (cmd.hasOption("friends")) cfg.fetchFriends = true;
+                if (cmd.hasOption("target-friends-count")) { // 100 by default
+                    cfg.numFriendsToFetch = Integer.parseInt(cmd.getOptionValue("target-friends-count"));
+                }
+                if (cmd.hasOption("mentions")) cfg.fetchMentions = true;
+                if (cmd.hasOption("target-mention-count")) { // 100 by default
+                    cfg.numMentionsToFetch = Integer.parseInt(cmd.getOptionValue("target-mention-count"));
+                }
                 if (cmd.hasOption('o')) cfg.outputDir = cmd.getOptionValue('o');
                 if (cmd.hasOption('c')) cfg.credentialsFile = cmd.getOptionValue('c');
                 if (cmd.hasOption('d')) cfg.debug = true;
@@ -310,6 +335,12 @@ public final class TwitterUserResourcesRetrieverApp {
     private Twitter twitter;
 
     /**
+     * Holds retrieved Twitter profiles, indexed by their IDs.
+     */
+    private final Map<Long, User> profileMap = Maps.newTreeMap();
+
+
+    /**
      * A simple callback interface.
      *
      * @param <Arg1> The type of the single argument to the callback.
@@ -317,7 +348,7 @@ public final class TwitterUserResourcesRetrieverApp {
      */
     @FunctionalInterface
     interface ApiCall<Arg1, RetType extends ApiCallResponse> {
-        public RetType apply(Arg1 arg1);
+        RetType apply(Arg1 arg1);
     }
 
 
@@ -345,6 +376,7 @@ public final class TwitterUserResourcesRetrieverApp {
         LOG.info("* output directory: " + this.cfg.outputDir);
         LOG.info("* tweets:     " + this.cfg.fetchTweets);
         LOG.info("* favourites: " + this.cfg.fetchFaves);
+        LOG.info("* mentions:   " + this.cfg.fetchMentions);
         LOG.info("* followers:  " + this.cfg.fetchFollowers);
         LOG.info("* friends:    " + this.cfg.fetchFriends);
 
@@ -360,6 +392,42 @@ public final class TwitterUserResourcesRetrieverApp {
         }
 
         this.twitter = this.establishTwitterConnection();
+
+        // retrieve profiles, first, to get screen names
+        for (final List<Long> batch : Lists.partition(Lists.newArrayList(ids), PROFILE_BATCH_SIZE)) {
+            try {
+                LOG.info("Looking up {} users' profiles", batch.size());
+
+                // ask Twitter for profiles
+                final long[] allocation = new long[batch.size()];
+                for (int i = 0; i < batch.size(); i++) {
+                    allocation[i] = batch.get(i);
+                }
+                final ResponseList<User> profiles = twitter.lookupUsers(allocation);
+
+                final String rawJSON = TwitterObjectFactory.getRawJSON(profiles);
+
+                profiles.forEach(p -> profileMap.put(p.getId(), p));
+
+                for (JsonNode profileNode : json.readTree(rawJSON)) {
+                    final String profileFile = profileNode.get("id_str").asText() + "-profile.json";
+                    try (BufferedWriter out = createFreshWriter(profileFile, true)) {
+                        out.append(profileNode.toString()).append('\n').flush();
+                    } catch (IOException e) {
+                        LOG.warn(
+                            "Couldn't save profile @" + profileNode.get("screen_name").asText() +
+                            " (#" + profileNode.get("id_str").asText() + ")",
+                            e
+                        );
+                    }
+                }
+
+                pauseIfNecessary(profiles.getRateLimitStatus());
+            } catch (TwitterException e) {
+                LOG.warn("Failed to communicate with Twitter somehow while getting profiles", e);
+            }
+
+        }
 
         int runningTotal = 0;
         for (final Long userId : ids) {
@@ -387,11 +455,21 @@ public final class TwitterUserResourcesRetrieverApp {
 
                     LOG.info("Collected favourites of #{}", userId);
                 }
+                // Retrieve mentions
+                if (this.cfg.fetchMentions) {
+                    LOG.info("Collecting mentions of #{} with {}", userId, GET_MENTIONS);
+
+                    fetchAndPersistTweets(
+                        userId, "mentions", GET_MENTIONS, cfg.numMentionsToFetch, this::createGetMentionsCallback
+                    );
+
+                    LOG.info("Collected mentions of #{}", userId);
+                }
                 // Retrieve followers
                 if (this.cfg.fetchFollowers) {
                     LOG.info("Collecting followers of #{} with {}", userId, GET_FOLLOWERS);
 
-                    fetchAndPersistIDs(userId, "followers", GET_FOLLOWERS, this::createGetFollowersCallback);
+                    fetchAndPersistIDs(userId, "followers", cfg.numFollowersToFetch, GET_FOLLOWERS, this::createGetFollowersCallback);
 
                     LOG.info("Collected followers of #{}", userId);
                 }
@@ -399,7 +477,7 @@ public final class TwitterUserResourcesRetrieverApp {
                 if (this.cfg.fetchFriends) {
                     LOG.info("Collecting accounts followed by #{} with {}", userId, GET_FRIENDS);
 
-                    fetchAndPersistIDs(userId, "friends", GET_FRIENDS, this::createGetFriendsCallback);
+                    fetchAndPersistIDs(userId, "friends", cfg.numFriendsToFetch, GET_FRIENDS, this::createGetFriendsCallback);
 
                     LOG.info("Collected accounts followed by #{}", userId);
                 }
@@ -413,10 +491,37 @@ public final class TwitterUserResourcesRetrieverApp {
         LOG.info("Retrieval complete in {} seconds.", timer.elapsed(TimeUnit.SECONDS));
     }
 
+    /**
+     * If the provided {@link RateLimitStatus} indicates that we are about to break the rate
+     * limit, in terms of number of calls or time window, then sleep for the rest of the period.
+     *
+     * @param status The current status of the our calls to Twitter
+     */
+    private void pauseIfNecessary(final RateLimitStatus status) {
+        if (status == null) {
+            return;
+        }
+
+        final int secondsUntilReset = status.getSecondsUntilReset();
+        final int callsRemaining = status.getRemaining();
+        if (secondsUntilReset < 10 || callsRemaining < 10) {
+            final int untilReset = Math.abs(status.getSecondsUntilReset()) + 10;
+            LOG.info("Rate limit reached. Waiting {} seconds starting at {}...", untilReset, new Date());
+            try {
+                Thread.sleep(untilReset * 1000);
+            } catch (InterruptedException e) {
+                LOG.warn("Interrupted while sleeping waiting for Twitter.", e);
+                Thread.currentThread().interrupt(); // reset interrupt flag
+            }
+            LOG.info("Resuming... at {}", new Date());
+        }
+    }
+
+
 
     /**
      * Fetches at least {@code fetchLimit} {@code tweetType} statuses (tweets)
-     * connected with {@link userId} using a callback created by the given
+     * connected with {@code userId} using a callback created by the given
      * {@code callbackGenerator} and the given {@code endpoint}.
      *
      * @param userId The ID of the Twitter user of interest.
@@ -467,11 +572,12 @@ public final class TwitterUserResourcesRetrieverApp {
 
     /**
      * Fetches all {@code idType} (e.g. "friends", "followers") IDs
-     * connected with {@link userId} using a callback created by the
+     * connected with {@code userId} using a callback created by the
      * given {@code callbackGenerator} and the given {@code endpoint}.
      *
      * @param userId The ID of the Twitter user of interest.
      * @param idType The type of IDs to collect (e.g. "friends", "followers").
+     * @param fetchTarget An upper bound on the number of IDs to fetch.
      * @param endpoint The Twitter RESTful endpoint that will be used.
      * @param callbackGenerator A function to generate an API-call specific callback to fetch the statuses.
      * @throws InterruptedException If something fails while sleeping to adhere to Twitter's rate limits.
@@ -480,12 +586,14 @@ public final class TwitterUserResourcesRetrieverApp {
     private void fetchAndPersistIDs(
         final Long userId,
         final String idType,
+        final int fetchTarget,
         final String endpoint,
         final Function<Long, ApiCall<Long, ApiCallResponse>> callbackGenerator
     ) throws InterruptedException {
         final String idsFile = outFile(userId + "-" + idType + ".txt");
+        int idsFetched = 0;
         try (BufferedWriter out = createFreshWriter(idsFile, true)) {
-            long cursor = -1, prevCursor = -1;
+            long cursor = -1, prevCursor;
             List<Long> ids = Collections.emptyList();
             boolean bail = false;
             do {
@@ -497,11 +605,15 @@ public final class TwitterUserResourcesRetrieverApp {
 
                 LOG.info("Collected {} {}, starting at cursor {}", ids.size(), idType, prevCursor);
 
+                idsFetched += ids.size();
                 for (Long id : ids) {
                     out.append(id.toString() + "\n").flush();
                 }
 
-                bail = (ids.size() < ID_BATCH_SIZE); // not enough to fill a batch
+                bail = (
+                    (ids.size() < ID_BATCH_SIZE) || // not enough to fill a batch
+                    idsFetched >= fetchTarget // we have enough overall
+                );
 
             } while (! bail && ! ids.isEmpty());
 
@@ -640,6 +752,41 @@ public final class TwitterUserResourcesRetrieverApp {
 
 
     /**
+     * Creates a callback to a Twitter API call to search for mentions younger
+     * (posted earlier) than {@code maxId} for a given Twitter ID (the argument
+     * to the callback), in batches of {@link #TWEET_BATCH_SIZE}.
+     *
+     * @param maxId Get tweets with IDs younger (less) than this ID.
+     * @return An {@link ApiCallResponse} instance.
+     */
+    private ApiCall<Long, ApiCallResponse> createGetMentionsCallback(final long maxId) {
+        return (Long id) -> {
+            final List<Object> mentionsRetrieved = Lists.newArrayList();
+            try {
+                final String screenName = "@" + profileMap.get(id).getScreenName();
+
+                LOG.info("Collecting tweets mentioning {} (#{}) with {}", screenName, id, GET_MENTIONS);
+
+                final Query mentionsQuery = new Query(screenName).count(MENTION_BATCH_SIZE);
+                final QueryResult mentions = this.twitter.search(mentionsQuery);
+                // extract raw json and collect it for the response
+                for (Status mention : mentions.getTweets()) {
+                    final String rawMention = TwitterObjectFactory.getRawJSON(mention);
+                    mentionsRetrieved.add(this.json.readTree(rawMention));
+                }
+                return apiCallSuccess(mentions.getRateLimitStatus(), mentionsRetrieved);
+            } catch (TwitterException e) {
+                logTwitterApiException(id, e);
+                return apiCallError(e.getRateLimitStatus(), mentionsRetrieved, e);
+            } catch (IOException e) {
+                LOG.warn("Barfed parsing JSON or saving to file tweets for {}.", id, e);
+                return apiCallError(e, mentionsRetrieved);
+            }
+        };
+    }
+
+
+    /**
      * Creates a callback to a Twitter API call to fetch a batch of followers
      * (starting at <code>cursor</code>, which should be -1 to begin) for a given ID.
      *
@@ -653,7 +800,7 @@ public final class TwitterUserResourcesRetrieverApp {
                 LOG.info("Collecting followers of account #{} with {}", id, GET_FOLLOWERS);
                 final IDs response = this.twitter.getFollowersIDs(id.longValue(), cursor);
                 Arrays.stream(response.getIDs())
-                    .map(Long::valueOf)
+                //    .map(Long::valueOf)
                     .forEach(batchOfIDs::add);
                 return new IDsApiCallResponse(
                     response.getRateLimitStatus(),
@@ -684,7 +831,7 @@ public final class TwitterUserResourcesRetrieverApp {
                 LOG.info("Collecting friends of account #{} with {}", id, GET_FRIENDS);
                 final IDs response = this.twitter.getFriendsIDs(id.longValue(), cursor);
                 Arrays.stream(response.getIDs())
-                    .map(Long::valueOf)
+                 //   .map(Long::valueOf)
                     .forEach(batchOfIDs::add);
                 return new IDsApiCallResponse(
                     response.getRateLimitStatus(),
@@ -736,6 +883,7 @@ public final class TwitterUserResourcesRetrieverApp {
         final ApiCall<Long, ApiCallResponse> callback
     ) throws InterruptedException {
         this.debug("Acquiring mutex for endpoint {}.", endpoint);
+        System.err.println("Current mutex keys: " + limitsMutex.keySet().stream().collect(Collectors.joining(",")));
         this.limitsMutex.get(endpoint).lockInterruptibly();
         try {
             this.debug("Acquired mutex for endpoint {}.", endpoint);
@@ -816,7 +964,8 @@ public final class TwitterUserResourcesRetrieverApp {
             "statuses",  // endpoint family for "/statuses/user_timeline",
             "favorites", // endpoint family for "/favorites/list",
             "followers", // endpoint family for "/followers/ids",
-            "friends"    // endpoint family for "/friends/ids"
+            "friends",    // endpoint family for "/friends/ids"
+            "search" // endpoint for searches for mentions
         );
         rateLimitStatuses.forEach((endpoint, rls) -> {
             this.limitsMutex.put(endpoint, new ReentrantLock(true));
@@ -877,14 +1026,13 @@ public final class TwitterUserResourcesRetrieverApp {
      * @param credentialsFile Property file of Twitter credentials.
      * @param debug Debug flag to pass to Twitter4j's config builder.
      * @return a Twitter4j {@link Configuration} object.
-     * @throws IOException if there's an error loading the application's
-     *         {@link #credentialsFile}.
+     * @throws IOException if there's an error loading the application's {@code credentialsFile}.
      */
     private static Configuration twitterConfig(
         final String credentialsFile, final boolean debug
     ) throws IOException {
 
-        final Properties credentials = loadCredentials(credentialsFile);
+        credentials = loadCredentials(credentialsFile);
 
         final ConfigurationBuilder conf = new ConfigurationBuilder();
         conf.setJSONStoreEnabled(true).setDebugEnabled(debug)
@@ -963,7 +1111,7 @@ public final class TwitterUserResourcesRetrieverApp {
      */
     private static Properties loadProxyProperties() {
         final Properties properties = new Properties();
-        Path proxyPath = checkPath(Paths.get("./proxy.properties"));
+        Path proxyPath = /*checkPath*/(Paths.get("./proxy.properties"));
         if (proxyPath.toFile().exists()) {
             boolean success = true;
             try (Reader fileReader = Files.newBufferedReader(proxyPath)) {
