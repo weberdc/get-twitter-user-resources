@@ -88,13 +88,13 @@ public final class TwitterUserResourcesRetrieverApp {
     private static final int SLEEP_DURATION_FUDGE_AMOUNT = 10000;
 
     /** Batches will miss deleted tweets and IDs, so account for that when looking at batch sizes. */
-    private static final int BATCH_FUDGE = 10;
+    private static final int BATCH_FUDGE = 100;
 
     /**
      * The maximum number of statuses (tweets) to request when asking for timeline
      * tweets or favourites from Twitter (as specified by Twitter's API docs).
      */
-    private static final int TWEET_BATCH_SIZE = 200 - BATCH_FUDGE;
+    private static final int TWEET_BATCH_SIZE = 200;
 
     /**
      * The maximum number of profiles to request when asking Twitter's API.
@@ -107,7 +107,7 @@ public final class TwitterUserResourcesRetrieverApp {
      *
      * @see <a href="https://developer.twitter.com/en/docs/accounts-and-users/follow-search-get-users/api-reference/get-followers-ids">GET /followers/ids - Twitter Developers</a>
      */
-    private static final int ID_BATCH_SIZE = /*200*/ 5000 - BATCH_FUDGE;
+    private static final int ID_BATCH_SIZE = /*200*/ 5000;
 
     private static final String GET_TWEETS = "/statuses/home_timeline";
     private static final String GET_FAVES = "/favorites/list";
@@ -374,11 +374,11 @@ public final class TwitterUserResourcesRetrieverApp {
 
         LOG.info("Collecting resources for Twitter ids in: " + this.cfg.idsFile);
         LOG.info("* output directory: " + this.cfg.outputDir);
-        LOG.info("* tweets:     " + this.cfg.fetchTweets);
-        LOG.info("* favourites: " + this.cfg.fetchFaves);
-        LOG.info("* mentions:   " + this.cfg.fetchMentions);
-        LOG.info("* followers:  " + this.cfg.fetchFollowers);
-        LOG.info("* friends:    " + this.cfg.fetchFriends);
+        LOG.info("* tweets:     " + this.cfg.fetchTweets + (this.cfg.fetchTweets ? " [" + this.cfg.numTweetsToFetch + "]" : ""));
+        LOG.info("* favourites: " + this.cfg.fetchFaves + (this.cfg.fetchFaves ? " [" + this.cfg.numFavouritesToFetch + "]" : ""));
+        LOG.info("* mentions:   " + this.cfg.fetchMentions + (this.cfg.fetchMentions ? " [" + this.cfg.numMentionsToFetch + "]" : ""));
+        LOG.info("* followers:  " + this.cfg.fetchFollowers + (this.cfg.fetchFollowers ? " [" + this.cfg.numFollowersToFetch + "]" : ""));
+        LOG.info("* friends:    " + this.cfg.fetchFriends + (this.cfg.fetchFriends ? " [" + this.cfg.numFriendsToFetch + "]" : ""));
 
         final Set<Long> ids = this.loadIDs(this.cfg);
 
@@ -561,7 +561,7 @@ public final class TwitterUserResourcesRetrieverApp {
                 maxId = minId;
                 LOG.info("Wrote another {} " + tweetType + " to {}", tweetNodes.size(), tweetsFile);
 
-                bail = (tweetNodes.size() < TWEET_BATCH_SIZE); // not enough to fill a batch
+                bail = (tweetNodes.size() < TWEET_BATCH_SIZE - BATCH_FUDGE); // not enough to fill a batch
             } while (! bail && ! tweetNodes.isEmpty() && tweetsFetched < fetchLimit);
 
         } catch (IOException e) {
@@ -611,7 +611,7 @@ public final class TwitterUserResourcesRetrieverApp {
                 }
 
                 bail = (
-                    (ids.size() < ID_BATCH_SIZE) || // not enough to fill a batch
+                    (ids.size() < ID_BATCH_SIZE - BATCH_FUDGE) || // not enough to fill a batch
                     idsFetched >= fetchTarget // we have enough overall
                 );
 
@@ -670,6 +670,26 @@ public final class TwitterUserResourcesRetrieverApp {
 
 
     /**
+     * Create a {@link Paging} instance for collecting batches of tweets older than
+     * {@code maxId}. if {@code maxId} is {@link #DEFAULT_MAX_ID}, then a {@link Paging}
+     * instance for the first page of results is returned.
+     *
+     * @param maxId The maximum ID of tweets being requested (i.e. get tweets older than this).
+     * @return A suitably configured {@link Paging} instance.
+     */
+    private Paging tweetsBefore(final long maxId) {
+        if (maxId == DEFAULT_MAX_ID) {
+            return new Paging(1, TWEET_BATCH_SIZE);
+        } else {
+            Paging pagingInfo = new Paging();
+            pagingInfo.setCount(TWEET_BATCH_SIZE);
+            pagingInfo.setMaxId(maxId);
+            return pagingInfo;
+        }
+    }
+
+
+    /**
      * Creates a callback to a Twitter API call to fetch the tweets younger
      * (posted earlier) than {@code maxId} for a given Twitter ID (the argument
      * to the callback), in batches of {@link #TWEET_BATCH_SIZE}.
@@ -697,26 +717,6 @@ public final class TwitterUserResourcesRetrieverApp {
                 return apiCallError(e, tweetsRetrieved);
             }
         };
-    }
-
-
-    /**
-     * Create a {@link Paging} instance for collecting batches of tweets older than
-     * {@code maxId}. if {@code maxId} is {@link #DEFAULT_MAX_ID}, then a {@link Paging}
-     * instance for the first page of results is returned.
-     *
-     * @param maxId The maximum ID of tweets being requested (i.e. get tweets older than this).
-     * @return A suitably configured {@link Paging} instance.
-     */
-    private Paging tweetsBefore(final long maxId) {
-        if (maxId == DEFAULT_MAX_ID) {
-            return new Paging(1, TWEET_BATCH_SIZE);
-        } else {
-            Paging pagingInfo = new Paging();
-            pagingInfo.setCount(TWEET_BATCH_SIZE);
-            pagingInfo.setMaxId(maxId);
-            return pagingInfo;
-        }
     }
 
 
